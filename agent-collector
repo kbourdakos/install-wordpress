@@ -1,15 +1,11 @@
 #!/bin/bash
 # ============================================================================
-# im360_remediation_collector_v9_production.sh
+# im360_forensic_collector_v10.sh
 #
-# Remote forensic data collector for Imunify360 incident investigation.
-# All commands are strictly read-only.
-#
-# UPDATES (v9):
-# - Added --help menu
-# - Added --domains for log filtering
-# - Added Target Summary with Nested App Detection
-# - Enhanced path resolution for Plesk/DirectAdmin
+# FIXES:
+# - Moved all Function Definitions to the top to prevent "command not found".
+# - Ensured resolve_docroot is available globally.
+# - Preserved all original forensic logic.
 #
 # Usage:
 #   bash collector.sh --domains "example.com" --no-dry-run
@@ -18,9 +14,10 @@
 # NOTE: -e is intentionally omitted. This collector must run to completion.
 set -uo pipefail
 
+# --- Variables ---
 OWNER=""
 DOMAIN=""
-TARGET_DOMAINS="" # ADDED: New variable for filtering
+TARGET_DOMAINS=""
 OUTFILE=""
 DRY_RUN="false"
 SECTIONS=""
@@ -36,7 +33,10 @@ else
     echo "WARNING: gawk not found — timestamps will be raw epoch values" >&2
 fi
 
-# --- ADDED: Help Function ---
+# ============================================================================
+# 1. CORE FUNCTION DEFINITIONS (Must be at the top)
+# ============================================================================
+
 show_help() {
     echo "Usage: ./collector.sh [OPTIONS]"
     echo "  --no-dry-run          Execute full scan (Required)."
@@ -47,16 +47,157 @@ show_help() {
     exit 0
 }
 
+resolve_docroot() {
+    local domain="$1"
+    # 1. PLESK
+    if [[ -d "/var/www/vhosts/$domain/httpdocs" ]]; then echo "/var/www/vhosts/$domain/httpdocs"; return; fi
+    if [[ -d "/var/www/vhosts/$domain" ]]; then echo "/var/www/vhosts/$domain"; return; fi
+    # 2. DIRECTADMIN
+    local da_path=$(find /home -maxdepth 4 -path "*/domains/$domain/public_html" -type d 2>/dev/null | head -1)
+    if [[ -n "$da_path" ]]; then echo "$da_path"; return; fi
+    # 3. cPANEL
+    if [[ -f /etc/userdomains ]]; then
+        local user=$(grep "^${domain}:" /etc/userdomains | cut -d: -f2 | xargs)
+        if [[ -n "$user" ]]; then
+             if [[ -d "/home/$user/public_html" ]]; then echo "/home/$user/public_html"; return; fi
+        fi
+    fi
+    # 4. FASTPANEL
+    local fp_path=$(find /var/www -maxdepth 4 -path "*/data/www/$domain" -type d 2>/dev/null | head -1)
+    if [[ -n "$fp_path" ]]; then echo "$fp_path"; return; fi
+    # 5. Fallback/Generic
+    if [[ -d "/var/www/$domain/public_html" ]]; then echo "/var/www/$domain/public_html"; return; fi
+    if [[ -d "/var/www/html/$domain" ]]; then echo "/var/www/html/$domain"; return; fi
+    # 6. Config Grep (Last Resort)
+    for conf in /etc/apache2/sites-enabled /etc/httpd/conf/httpd.conf /etc/nginx/sites-enabled /usr/local/apache/conf/httpd.conf; do
+        if [[ -e "$conf" ]]; then
+            local path=$(grep -rA10 "$domain" "$conf" 2>/dev/null | grep -iE "DocumentRoot|root" | head -1 | awk '{print $2}' | tr -d '";')
+            if [[ -n "$path" && -d "$path" ]]; then echo "$path"; return; fi
+        fi
+    done
+    echo "NOT_FOUND"
+}
+
+detect_cms() {
+    local dir="$1"
+    [[ ! -d "$dir" ]] && echo "Invalid Path" && return
+    if [[ -f "$dir/wp-config.php" ]]; then
+        local ver="Unknown"
+        [[ -f "$dir/wp-includes/version.php" ]] && ver=$(grep "wp_version =" "$dir/wp-includes/version.php" | cut -d"'" -f2)
+        echo "WordPress (v$ver)"; return
+    fi
+    if [[ -f "$dir/configuration.php" && -d "$dir/administrator" ]]; then echo "Joomla"; return; fi
+    if [[ -f "$dir/config/settings.inc.php" || -f "$dir/app/config/parameters.php" ]]; then echo "PrestaShop"; return; fi
+    if [[ -f "$dir/app/etc/env.php" || -f "$dir/app/etc/local.xml" ]]; then echo "Magento"; return; fi
+    if [[ -f "$dir/artisan" && -d "$dir/app" ]]; then echo "Laravel"; return; fi
+    if [[ -f "$dir/sites/default/settings.php" ]]; then echo "Drupal"; return; fi
+    if [[ -f "$dir/config.php" && -d "$dir/admin" ]]; then echo "OpenCart"; return; fi
+    echo "Unknown/Custom"
+}
+
+scan_nested_apps() {
+    local root="$1"
+    # Deep crawl (level 6) skipping heavy folders
+    find "$root" -maxdepth 6 \
+        \( -name "wp-config.php" -o -name "configuration.php" -o -name "artisan" -o -name "env.php" -o -name "settings.inc.php" \) \
+        ! -path "*/vendor/*" ! -path "*/node_modules/*" ! -path "*/cache/*" ! -path "*/.git/*" \
+        -print0 2>/dev/null | while IFS= read -r -d '' file; do
+        local app_dir=$(dirname "$file")
+        if [[ "$app_dir" == "$root" ]]; then continue; fi
+        local child_type=$(detect_cms "$app_dir")
+        local rel_path="${app_dir#$root}"
+        if [[ "$child_type" != "Unknown/Custom" ]]; then
+             printf "   |__ [NESTED] %-20s | %-40s\n" "$child_type" "$rel_path"
+        fi
+    done
+}
+
+inspect_domain() {
+    local _domain="$1"
+    local _docroot="$2"
+    echo "---domain:${_domain}---"
+    echo "document_root=$_docroot"
+    echo "disk_usage=$(du -sh "$_docroot" 2>/dev/null | awk '{print $1}' || echo unknown)"
+    if [[ -f "${_docroot}/wp-config.php" ]]; then
+        echo "wordpress=yes"
+        local _wpver=$(grep 'wp_version\s*=' "${_docroot}/wp-includes/version.php" 2>/dev/null | grep -oP "'[^']+'" | tr -d "'" || echo "unknown")
+        echo "wp_version=$_wpver"
+        local _dbpfx=$(grep 'table_prefix' "${_docroot}/wp-config.php" 2>/dev/null | grep -oP "'[^']+'" | head -1 || echo "wp_")
+        echo "wp_db_prefix=$_dbpfx"
+        local _wpdebug=$(grep 'WP_DEBUG' "${_docroot}/wp-config.php" 2>/dev/null | head -1 || echo "not_set")
+        echo "wp_debug=$_wpdebug"
+    else
+        echo "wordpress=no"
+    fi
+    echo "---docroot_listing:${_domain}---"
+    ls -la "$_docroot" 2>/dev/null | head -40
+    if [[ -f "${_docroot}/wp-config.php" ]] && command -v wp &>/dev/null; then
+        local -a _wp=(wp "--path=${_docroot}" --no-color --allow-root)
+        echo "---wp_verify_checksums:${_domain}---"
+        "${_wp[@]}" core verify-checksums 2>&1 | head -200 || echo "unavailable"
+        echo "---wp_plugin_list:${_domain}---"
+        "${_wp[@]}" plugin list --format=table 2>/dev/null | head -100 || echo "unavailable"
+        echo "---wp_theme_list:${_domain}---"
+        "${_wp[@]}" theme list --format=table 2>/dev/null | head -50 || echo "unavailable"
+        echo "---wp_admin_users:${_domain}---"
+        "${_wp[@]}" user list --role=administrator --format=table 2>/dev/null | head -50 || echo "unavailable"
+        echo "---wp_cron_events:${_domain}---"
+        "${_wp[@]}" cron event list --format=table 2>/dev/null | head -100 || echo "unavailable"
+    fi
+}
+
+discover_account_domains() {
+    local _owner="$1"
+    local _domains=()
+    local _hdir="${HOMEDIR:-}"
+    if [[ -z "$_hdir" ]]; then _hdir=$(getent passwd "$_owner" 2>/dev/null | cut -d: -f6); fi
+    if [[ -f "/var/cpanel/users/${_owner}" ]]; then
+        while IFS= read -r line; do _domains+=("$line"); done < <(grep -oP '(?<=DNS=|DNS\d*=)\S+' "/var/cpanel/users/${_owner}" 2>/dev/null)
+    fi
+    if [[ -d "/var/www/vhosts" ]]; then
+        for d in /var/www/vhosts/*/httpdocs; do
+            [[ -d "$d" ]] || continue
+            local _vdom=$(basename "$(dirname "$d")")
+            if [[ "$(stat -c '%U' "$d" 2>/dev/null)" == "$_owner" ]]; then _domains+=("$_vdom"); fi
+        done
+    fi
+    if [[ -f "/usr/local/directadmin/data/users/${_owner}/domains.list" ]]; then
+        while IFS= read -r line; do [[ -n "$line" ]] && _domains+=("$line"); done < "/usr/local/directadmin/data/users/${_owner}/domains.list"
+    fi
+    if [[ ${#_domains[@]} -eq 0 && -n "$_hdir" && -d "$_hdir" ]]; then
+        while IFS= read -r wpconf; do
+            local _dr=$(dirname "$wpconf")
+            local _dname=$(basename "$_dr")
+            [[ "$_dname" == "public_html" ]] && _dname=$(basename "$(dirname "$_dr")")
+            _domains+=("$_dname|$_dr")
+        done < <(find "$_hdir" -maxdepth 4 -name 'wp-config.php' -type f 2>/dev/null)
+    fi
+    if [[ ${#_domains[@]} -gt 0 ]]; then printf '%s\n' "${_domains[@]}" | sort -u; fi
+}
+
+_run_section() {
+    [[ -z "$SECTIONS" ]] && return 0
+    local section="$1"
+    local IFS=','
+    for s in $SECTIONS; do
+        [[ "$s" == "$section" ]] && return 0
+    done
+    return 1
+}
+
+# ============================================================================
+# 2. ARGUMENT PARSING
+# ============================================================================
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --owner)      [[ $# -ge 2 ]] && OWNER="$2" && shift 2 || { echo "ERROR: --owner requires a value" >&2; shift; } ;;
         --domain)     [[ $# -ge 2 ]] && DOMAIN="$2" && shift 2 || { echo "ERROR: --domain requires a value" >&2; shift; } ;;
-        --domains)    [[ $# -ge 2 ]] && TARGET_DOMAINS="$2" && shift 2 || { echo "ERROR: --domains requires a value" >&2; shift; } ;; # ADDED
+        --domains)    [[ $# -ge 2 ]] && TARGET_DOMAINS="$2" && shift 2 || { echo "ERROR: --domains requires a value" >&2; shift; } ;;
         --out)        [[ $# -ge 2 ]] && OUTFILE="$2" && shift 2 || { echo "ERROR: --out requires a value" >&2; shift; } ;;
         --sections)   [[ $# -ge 2 ]] && SECTIONS="$2" && shift 2 || { echo "ERROR: --sections requires a value" >&2; shift; } ;;
         --no-dry-run) DRY_RUN="false"; shift ;;
         --dry-run)    DRY_RUN="true"; shift ;;
-        --help|-h)    show_help ;; # ADDED
+        --help|-h)    show_help ;;
         *)            shift ;;
     esac
 done
@@ -87,19 +228,11 @@ if [[ "$DRY_RUN" == "true" ]]; then
     exit 0
 fi
 
-_run_section() {
-    [[ -z "$SECTIONS" ]] && return 0
-    local section="$1"
-    local IFS=','
-    for s in $SECTIONS; do
-        [[ "$s" == "$section" ]] && return 0
-    done
-    return 1
-}
+# ============================================================================
+# 3. FORENSIC EXECUTION START
+# ============================================================================
 
-# ---------------------------------------------------------------------------
 # 1. System Information
-# ---------------------------------------------------------------------------
 echo "===SECTION:system==="
 echo "hostname=$(hostname 2>/dev/null || echo unknown)"
 echo "kernel=$(uname -r 2>/dev/null || echo unknown)"
@@ -109,9 +242,7 @@ echo "uptime=$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
 echo "load=$(cat /proc/loadavg 2>/dev/null || echo unknown)"
 echo "current_time=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo unknown)"
 
-# ---------------------------------------------------------------------------
 # 2. Imunify360 Agent
-# ---------------------------------------------------------------------------
 if _run_section "imunify"; then
 echo "===SECTION:imunify==="
 if command -v imunify360-agent &>/dev/null; then
@@ -136,9 +267,7 @@ else
 fi
 fi
 
-# ---------------------------------------------------------------------------
-# 2b. Discover all hosting accounts
-# ---------------------------------------------------------------------------
+# 3. Discover Accounts
 echo "===SECTION:accounts==="
 _SYS_EXACT='root|bin|daemon|adm|lp|sync|shutdown|halt|mail|operator|games|ftp|nobody|dbus|polkitd|sshd|postfix|chrony|ntp|nscd|tcpdump|avahi|mysql|mysqld|postgres|redis|memcached|mongodb|nginx|apache|httpd|www-data|lighttpd|named|dovecot|cyrus|exim|mailman|mailnull|smmsp|clamav|clamupdate|amavis|opendkim|whm|softaculous|solr|tomcat|prosody|varnish|haproxy|plesk|psa|drweb|imunify360|imav-hoster|roundcube|psaadm|psaftp|git|svn|puppet|chef|docker|libvirt|qemu|virtuser|lsadm|litespeed|lscpd|nfsnobody|rpc|rpcuser|saslauth|abrt|setroubleshoot|sssd|gdm|unbound|gluster|ovirt|zabbix|nagios|prometheus|grafana|node_exporter|elasticsearch|kibana|logstash|jenkins|gitlab|deployer|ansible|ec2-user|centos|ubuntu|cloud-user|oprofile'
 _SYS_PREFIX='systemd-|cpanel|ossec|_imunify|imunify360-|sw-cp-|sw-engine|gnome-initial'
@@ -152,7 +281,6 @@ while IFS=: read -r _uname _ _uid _ _ _uhome _; do
     echo "$_uname" | grep -qE "^(${_SYS_EXACT})$" && continue
     echo "$_uname" | grep -qE "^(${_SYS_PREFIX})" && continue
     [[ -z "$_uhome" || "$_uhome" == "/" || "$_uhome" == "/bin"* || "$_uhome" == "/sbin"* || "$_uhome" == "/usr"* || "$_uhome" == "/dev"* ]] && continue
-
     _docroot=""
     for _dr_cand in "${_uhome}/public_html" "${_uhome}/httpdocs" "${_uhome}/htdocs" "${_uhome}/www" "${_uhome}/web" "${_uhome}/public"; do
         if [[ -d "$_dr_cand" ]]; then _docroot="$_dr_cand"; break; fi
@@ -165,7 +293,6 @@ while IFS=: read -r _uname _ _uid _ _ _uhome _; do
     fi
     _wp="no"
     if [[ -n "$_docroot" && -f "${_docroot}/wp-config.php" ]]; then _wp="yes"; fi
-
     echo "account=${_uname}|uid=${_uid}|home=${_uhome}|docroot=${_docroot:-none}|wordpress=${_wp}|home_exists=$([[ -d "$_uhome" ]] && echo yes || echo no)"
     ALL_ACCOUNTS+=("$_uname")
     _acct_count=$((_acct_count + 1))
@@ -190,12 +317,9 @@ if [[ -d /var/cpanel/users ]]; then
         _acct_count=$((_acct_count + 1))
     done
 fi
-
 echo "total_accounts=${_acct_count}"
 
-# ---------------------------------------------------------------------------
-# 2c. WordPress Sites Discovery
-# ---------------------------------------------------------------------------
+# 4. WordPress Sites (Partial Logic for truncated scan)
 echo "===SECTION:wordpress_sites==="
 _wp_count=0
 _discover_wp_sites() {
@@ -212,8 +336,7 @@ _discover_wp_sites() {
         fi
         local _active="yes"
         [[ ! -f "${_wpdir}/wp-settings.php" ]] && _active="partial"
-        local _dbpfx
-        _dbpfx=$(grep -m1 'table_prefix' "$_wpcfg" 2>/dev/null | grep -oP "'[^']+'" | head -1 | tr -d "'" || echo "wp_")
+        local _dbpfx=$(grep -m1 'table_prefix' "$_wpcfg" 2>/dev/null | grep -oP "'[^']+'" | head -1 | tr -d "'" || echo "wp_")
         [[ -z "$_dbpfx" ]] && _dbpfx="wp_"
         echo "wp_site=${_acctname}|path=${_wpdir}|version=${_ver}|db_prefix=${_dbpfx}|active=${_active}"
         _wp_count=$((_wp_count + 1))
@@ -237,9 +360,7 @@ elif [[ ${#ALL_ACCOUNTS[@]} -gt 0 ]]; then
 fi
 echo "total_wp_sites=${_wp_count}"
 
-# ---------------------------------------------------------------------------
-# 3. User / Account Info
-# ---------------------------------------------------------------------------
+# 5. User / Account Info
 if _run_section "user_info"; then
 echo "===SECTION:user_info==="
 if [[ -n "$OWNER" ]]; then
@@ -300,9 +421,7 @@ else
     done
 fi
 
-# ---------------------------------------------------------------------------
-# Filesystem Scans (Hidden, Recent PHP, Strange, Permissions, Root, CageFS, Sigs)
-# ---------------------------------------------------------------------------
+# 6. Filesystem Scans
 if _run_section "filesystem"; then
 echo "===SECTION:hidden_files==="
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
@@ -459,72 +578,7 @@ else
 fi
 fi # end filesystem
 
-# ---------------------------------------------------------------------------
-# 4. Domain Info (Updated inspect_domain and resolve_docroot with new logic)
-# ---------------------------------------------------------------------------
-inspect_domain() {
-    local _domain="$1"
-    local _docroot="$2"
-    echo "---domain:${_domain}---"
-    echo "document_root=$_docroot"
-    echo "disk_usage=$(du -sh "$_docroot" 2>/dev/null | awk '{print $1}' || echo unknown)"
-    if [[ -f "${_docroot}/wp-config.php" ]]; then
-        echo "wordpress=yes"
-        local _wpver=$(grep 'wp_version\s*=' "${_docroot}/wp-includes/version.php" 2>/dev/null | grep -oP "'[^']+'" | tr -d "'" || echo "unknown")
-        echo "wp_version=$_wpver"
-        local _dbpfx=$(grep 'table_prefix' "${_docroot}/wp-config.php" 2>/dev/null | grep -oP "'[^']+'" | head -1 || echo "wp_")
-        echo "wp_db_prefix=$_dbpfx"
-        local _wpdebug=$(grep 'WP_DEBUG' "${_docroot}/wp-config.php" 2>/dev/null | head -1 || echo "not_set")
-        echo "wp_debug=$_wpdebug"
-    else
-        echo "wordpress=no"
-    fi
-    echo "---docroot_listing:${_domain}---"
-    ls -la "$_docroot" 2>/dev/null | head -40
-    if [[ -f "${_docroot}/wp-config.php" ]] && command -v wp &>/dev/null; then
-        local -a _wp=(wp "--path=${_docroot}" --no-color --allow-root)
-        echo "---wp_verify_checksums:${_domain}---"
-        "${_wp[@]}" core verify-checksums 2>&1 | head -200 || echo "unavailable"
-        echo "---wp_plugin_list:${_domain}---"
-        "${_wp[@]}" plugin list --format=table 2>/dev/null | head -100 || echo "unavailable"
-        echo "---wp_theme_list:${_domain}---"
-        "${_wp[@]}" theme list --format=table 2>/dev/null | head -50 || echo "unavailable"
-        echo "---wp_admin_users:${_domain}---"
-        "${_wp[@]}" user list --role=administrator --format=table 2>/dev/null | head -50 || echo "unavailable"
-        echo "---wp_cron_events:${_domain}---"
-        "${_wp[@]}" cron event list --format=table 2>/dev/null | head -100 || echo "unavailable"
-    fi
-}
-
-discover_account_domains() {
-    local _owner="$1"
-    local _domains=()
-    local _hdir="${HOMEDIR:-}"
-    if [[ -z "$_hdir" ]]; then _hdir=$(getent passwd "$_owner" 2>/dev/null | cut -d: -f6); fi
-    if [[ -f "/var/cpanel/users/${_owner}" ]]; then
-        while IFS= read -r line; do _domains+=("$line"); done < <(grep -oP '(?<=DNS=|DNS\d*=)\S+' "/var/cpanel/users/${_owner}" 2>/dev/null)
-    fi
-    if [[ -d "/var/www/vhosts" ]]; then
-        for d in /var/www/vhosts/*/httpdocs; do
-            [[ -d "$d" ]] || continue
-            local _vdom=$(basename "$(dirname "$d")")
-            if [[ "$(stat -c '%U' "$d" 2>/dev/null)" == "$_owner" ]]; then _domains+=("$_vdom"); fi
-        done
-    fi
-    if [[ -f "/usr/local/directadmin/data/users/${_owner}/domains.list" ]]; then
-        while IFS= read -r line; do [[ -n "$line" ]] && _domains+=("$line"); done < "/usr/local/directadmin/data/users/${_owner}/domains.list"
-    fi
-    if [[ ${#_domains[@]} -eq 0 && -n "$_hdir" && -d "$_hdir" ]]; then
-        while IFS= read -r wpconf; do
-            local _dr=$(dirname "$wpconf")
-            local _dname=$(basename "$_dr")
-            [[ "$_dname" == "public_html" ]] && _dname=$(basename "$(dirname "$_dr")")
-            _domains+=("$_dname|$_dr")
-        done < <(find "$_hdir" -maxdepth 4 -name 'wp-config.php' -type f 2>/dev/null)
-    fi
-    if [[ ${#_domains[@]} -gt 0 ]]; then printf '%s\n' "${_domains[@]}" | sort -u; fi
-}
-
+# 7. Domain Info (USING THE UNIVERSAL RESOLVER)
 if _run_section "domain_info"; then
 echo "===SECTION:domain_info==="
 if [[ -n "$DOMAIN" ]]; then
@@ -565,9 +619,7 @@ else
 fi
 fi
 
-# ---------------------------------------------------------------------------
-# 5. Imunify360 local SQLite databases
-# ---------------------------------------------------------------------------
+# 8. Imunify360 DB
 if _run_section "imunify_db"; then
 echo "===SECTION:imunify_db==="
 SQLITE="/opt/alt/sqlite/usr/bin/sqlite3"
@@ -594,9 +646,7 @@ if command -v imunify360-agent &>/dev/null; then
 else echo "imunify_not_installed"; fi
 fi
 
-# ---------------------------------------------------------------------------
-# 6. Active connections & suspicious processes
-# ---------------------------------------------------------------------------
+# 9. Network
 if _run_section "network"; then
 OWNER_UID=""; echo "===SECTION:network==="; echo "---outbound_connections---"
 if [[ -n "$OWNER" ]]; then
@@ -611,9 +661,7 @@ if [[ -n "$OWNER" ]]; then ps -u "$OWNER" -o pid,ppid,cmd,%cpu,%mem,etime --sort
 else ps aux 2>/dev/null | grep -iE 'perl|python.*base64|wget.*sh|curl.*sh|nc\s+-|ncat|cryptominer|xmrig|minerd|kswapd[0-9]|kworker.*deleted|wpboost|ld-linux.*deleted|/var/tmp/|/dev/shm/|memfd:|\.hide|/tmp/\.' | grep -v grep | head -30 || echo "none"; fi
 fi
 
-# ---------------------------------------------------------------------------
-# 7. In-memory malware detection
-# ---------------------------------------------------------------------------
+# 10. In-Memory
 if _run_section "inmemory"; then
 echo "===SECTION:inmemory_malware==="
 echo "---deleted_binaries---"
@@ -650,9 +698,7 @@ for pid in $(ps -eo pid,%cpu,user --sort=-%cpu 2>/dev/null | awk -v ou="${OWNER_
 done 2>/dev/null
 fi
 
-# ---------------------------------------------------------------------------
-# 8. Malware Log
-# ---------------------------------------------------------------------------
+# 11. Malware Log
 if _run_section "malware_log"; then
 echo "===SECTION:malware_log_extract==="
 if [[ -f /var/log/imunify360/console.log ]]; then
@@ -660,9 +706,7 @@ if [[ -f /var/log/imunify360/console.log ]]; then
 else echo "console_log_not_found"; fi
 fi
 
-# ---------------------------------------------------------------------------
-# 9. Logs (UPDATED with filtering logic)
-# ---------------------------------------------------------------------------
+# 12. Logs
 if _run_section "logs"; then
 echo "===SECTION:logs==="
 grep_pattern=""
@@ -704,13 +748,10 @@ for logfile in \
 done
 fi
 
-# ============================================================================
-# NEW SECTION: TARGET SUMMARY (ADDED AT THE END)
-# ============================================================================
+# 13. TARGET SUMMARY (NEW SECTION)
 echo ""
 echo "===SECTION:target_summary==="
 echo "Timestamp: $(date -u)"
-
 if [[ -z "$TARGET_DOMAINS" ]]; then
     echo "No specific domains targeted for Summary. Pass --domains or --domain to use this feature."
 else
@@ -727,11 +768,7 @@ else
             app_type=$(detect_cms "$docroot")
         fi
         printf "%-30s | %-25s | %-40s\n" "$d" "$app_type" "$docroot"
-        
-        # Deep recursion for Nested Apps
-        if [[ "$docroot" != "NOT_FOUND" ]]; then
-            scan_nested_apps "$docroot"
-        fi
+        if [[ "$docroot" != "NOT_FOUND" ]]; then scan_nested_apps "$docroot"; fi
     done
     echo "----------------------------------------------------------------------------------------------------"
 fi
