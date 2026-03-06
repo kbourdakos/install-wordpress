@@ -1,237 +1,734 @@
 #!/bin/bash
 # ============================================================================
-# im360_forensic_collector_v6_universal.sh
+# im360_remediation_collector_v9_production.sh
 #
-# FEATURES:
-# - Universal Panel Support: cPanel, Plesk, DirectAdmin, FastPanel, Custom.
-# - Deep Nested Discovery: Finds WP/Joomla/Laravel inside subfolders.
-# - CMS Detection: WP, Magento, Presta, Joomla, Drupal, OpenCart, Laravel.
+# Remote forensic data collector for Imunify360 incident investigation.
+# All commands are strictly read-only.
+#
+# UPDATES (v9):
+# - Added --help menu
+# - Added --domains for log filtering
+# - Added Target Summary with Nested App Detection
+# - Enhanced path resolution for Plesk/DirectAdmin
 #
 # Usage:
-#   bash collector.sh --domains "example.com,shop.net" --no-dry-run
+#   bash collector.sh --domains "example.com" --no-dry-run
 # ============================================================================
 
+# NOTE: -e is intentionally omitted. This collector must run to completion.
 set -uo pipefail
 
-# --- Variables ---
 OWNER=""
-DOMAIN_ARG=""
-DOMAINS_LIST_ARG=""
-FINAL_TARGETS=""
+DOMAIN=""
+TARGET_DOMAINS="" # ADDED: New variable for filtering
 OUTFILE=""
-DRY_RUN="true"
-SCAN_DIRS=()
+DRY_RUN="false"
+SECTIONS=""
+HOMEDIR=""
 
-# --- Detect awk ---
-if command -v gawk &>/dev/null; then _AWK=gawk; else _AWK=awk; fi
+# Detect awk variant
+if command -v gawk &>/dev/null; then
+    _AWK=gawk
+elif awk 'BEGIN{exit (strftime("%Y",0)=="1970"?0:1)}' 2>/dev/null; then
+    _AWK=awk
+else
+    _AWK=awk
+    echo "WARNING: gawk not found — timestamps will be raw epoch values" >&2
+fi
 
-# --- Argument Parsing ---
+# --- ADDED: Help Function ---
+show_help() {
+    echo "Usage: ./collector.sh [OPTIONS]"
+    echo "  --no-dry-run          Execute full scan (Required)."
+    echo "  --domains <LIST>      Filter logs & summary for specific domains (comma-separated)."
+    echo "  --domain <DOMAIN>     Target a single domain."
+    echo "  --owner <USER>        Target a specific system user."
+    echo "  --out <FILE>          Save output to file."
+    exit 0
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --owner)      [[ $# -ge 2 ]] && OWNER="$2" && shift 2 ;;
-        --domain)     [[ $# -ge 2 ]] && DOMAIN_ARG="$2" && shift 2 ;;
-        --domains)    [[ $# -ge 2 ]] && DOMAINS_LIST_ARG="$2" && shift 2 ;;
-        --out)        [[ $# -ge 2 ]] && OUTFILE="$2" && shift 2 ;;
+        --owner)      [[ $# -ge 2 ]] && OWNER="$2" && shift 2 || { echo "ERROR: --owner requires a value" >&2; shift; } ;;
+        --domain)     [[ $# -ge 2 ]] && DOMAIN="$2" && shift 2 || { echo "ERROR: --domain requires a value" >&2; shift; } ;;
+        --domains)    [[ $# -ge 2 ]] && TARGET_DOMAINS="$2" && shift 2 || { echo "ERROR: --domains requires a value" >&2; shift; } ;; # ADDED
+        --out)        [[ $# -ge 2 ]] && OUTFILE="$2" && shift 2 || { echo "ERROR: --out requires a value" >&2; shift; } ;;
+        --sections)   [[ $# -ge 2 ]] && SECTIONS="$2" && shift 2 || { echo "ERROR: --sections requires a value" >&2; shift; } ;;
         --no-dry-run) DRY_RUN="false"; shift ;;
         --dry-run)    DRY_RUN="true"; shift ;;
+        --help|-h)    show_help ;; # ADDED
         *)            shift ;;
     esac
 done
 
-# Merge domain args
-if [[ -n "$DOMAIN_ARG" ]]; then FINAL_TARGETS="$DOMAIN_ARG"; fi
-if [[ -n "$DOMAINS_LIST_ARG" ]]; then
-    if [[ -n "$FINAL_TARGETS" ]]; then FINAL_TARGETS="$FINAL_TARGETS,$DOMAINS_LIST_ARG"; else FINAL_TARGETS="$DOMAINS_LIST_ARG"; fi
+# Merge single domain into target list if present
+if [[ -n "$DOMAIN" ]]; then
+    if [[ -n "$TARGET_DOMAINS" ]]; then TARGET_DOMAINS="$TARGET_DOMAINS,$DOMAIN"; else TARGET_DOMAINS="$DOMAIN"; fi
 fi
 
-# Redirect output
-if [[ -n "$OUTFILE" ]]; then exec > "$OUTFILE"; echo "Writing output to $OUTFILE" >&2; fi
+# If --out is set, redirect all subsequent stdout to that file
+if [[ -n "$OUTFILE" ]]; then
+    exec > "$OUTFILE"
+    echo "Writing output to $OUTFILE" >&2
+fi
 
-# --- Dry Run Check ---
+# ---------------------------------------------------------------------------
+# Dry-run mode
+# ---------------------------------------------------------------------------
 if [[ "$DRY_RUN" == "true" ]]; then
     echo "===SECTION:dry_run==="
-    echo "message=Pass --no-dry-run to execute. This scan crawls nested directories."
+    echo "mode=dry_run"
+    echo "message=Pass --no-dry-run to execute. Pass --help for options."
+    echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+    echo "current_time=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo unknown)"
+    echo "---w---"
+    w 2>/dev/null || echo "w_unavailable"
+    echo "===SECTION:done==="
     exit 0
 fi
 
-# ============================================================================
-# UNIVERSAL RESOLVER & CMS DETECTION
-# ============================================================================
-
-resolve_docroot() {
-    local domain="$1"
-    
-    # 1. PLESK (Standard & Subdomains)
-    if [[ -d "/var/www/vhosts/$domain/httpdocs" ]]; then echo "/var/www/vhosts/$domain/httpdocs"; return; fi
-    if [[ -d "/var/www/vhosts/$domain" ]]; then echo "/var/www/vhosts/$domain"; return; fi
-
-    # 2. DIRECTADMIN (Standard Layout: /home/USER/domains/DOMAIN/public_html)
-    # We try to find the user who owns the domain via grep or wildcard
-    local da_path=$(find /home -maxdepth 4 -path "*/domains/$domain/public_html" -type d 2>/dev/null | head -1)
-    if [[ -n "$da_path" ]]; then echo "$da_path"; return; fi
-
-    # 3. cPANEL (Lookup user in /etc/userdomains)
-    if [[ -f /etc/userdomains ]]; then
-        local user=$(grep "^${domain}:" /etc/userdomains | cut -d: -f2 | xargs)
-        if [[ -n "$user" ]]; then
-             if [[ -d "/home/$user/public_html" ]]; then echo "/home/$user/public_html"; return; fi
-             if [[ -d "/home2/$user/public_html" ]]; then echo "/home2/$user/public_html"; return; fi
-        fi
-    fi
-
-    # 4. FASTPANEL (Standard Layout: /var/www/USER/data/www/DOMAIN)
-    local fp_path=$(find /var/www -maxdepth 4 -path "*/data/www/$domain" -type d 2>/dev/null | head -1)
-    if [[ -n "$fp_path" ]]; then echo "$fp_path"; return; fi
-
-    # 5. CYBERPANEL / GENERIC APACHE/NGINX
-    if [[ -d "/home/$domain/public_html" ]]; then echo "/home/$domain/public_html"; return; fi
-    if [[ -d "/var/www/$domain/public_html" ]]; then echo "/var/www/$domain/public_html"; return; fi
-    if [[ -d "/var/www/$domain" ]]; then echo "/var/www/$domain"; return; fi
-    if [[ -d "/var/www/html/$domain" ]]; then echo "/var/www/html/$domain"; return; fi
-
-    # 6. Fallback: Grep Web Server Configs
-    for conf in /etc/apache2/sites-enabled /etc/httpd/conf/httpd.conf /etc/nginx/sites-enabled /usr/local/apache/conf/httpd.conf; do
-        if [[ -e "$conf" ]]; then
-            local path=$(grep -rA10 "$domain" "$conf" 2>/dev/null | grep -iE "DocumentRoot|root" | head -1 | awk '{print $2}' | tr -d '";')
-            if [[ -n "$path" && -d "$path" ]]; then echo "$path"; return; fi
-        fi
+_run_section() {
+    [[ -z "$SECTIONS" ]] && return 0
+    local section="$1"
+    local IFS=','
+    for s in $SECTIONS; do
+        [[ "$s" == "$section" ]] && return 0
     done
-
-    echo "NOT_FOUND"
+    return 1
 }
 
-detect_cms() {
-    local dir="$1"
-    [[ ! -d "$dir" ]] && echo "Invalid Path" && return
-
-    # Signatures
-    if [[ -f "$dir/wp-config.php" ]]; then
-        local ver="Unknown"
-        [[ -f "$dir/wp-includes/version.php" ]] && ver=$(grep "wp_version =" "$dir/wp-includes/version.php" | cut -d"'" -f2)
-        echo "WordPress (v$ver)"
-        return
-    fi
-    if [[ -f "$dir/configuration.php" && -d "$dir/administrator" ]]; then echo "Joomla"; return; fi
-    if [[ -f "$dir/config/settings.inc.php" || -f "$dir/app/config/parameters.php" ]]; then echo "PrestaShop"; return; fi
-    if [[ -f "$dir/app/etc/env.php" || -f "$dir/app/etc/local.xml" ]]; then echo "Magento"; return; fi
-    if [[ -f "$dir/artisan" && -d "$dir/app" ]]; then echo "Laravel"; return; fi
-    if [[ -f "$dir/sites/default/settings.php" || -f "$dir/core/lib/Drupal.php" ]]; then echo "Drupal"; return; fi
-    if [[ -f "$dir/config.php" && -d "$dir/admin" && -f "$dir/admin/config.php" ]]; then echo "OpenCart"; return; fi
-    
-    echo "Unknown/Custom"
-}
-
-scan_nested_apps() {
-    local root="$1"
-    
-    # We scan 6 levels deep for specific CMS config markers.
-    # We EXCLUDE cache, vendor, node_modules, and .git to prevent false positives and slow scans.
-    
-    find "$root" -maxdepth 6 \
-        \( -name "wp-config.php" -o -name "configuration.php" -o -name "artisan" \
-           -o -name "env.php" -o -name "settings.inc.php" -o -name "config.php" \) \
-        ! -path "*/vendor/*" ! -path "*/node_modules/*" ! -path "*/cache/*" \
-        ! -path "*/wp-includes/*" ! -path "*/.git/*" ! -path "*/storage/*" \
-        -print0 2>/dev/null | while IFS= read -r -d '' file; do
-        
-        local app_dir=$(dirname "$file")
-        
-        # Skip if it is the root (already reported as main app)
-        if [[ "$app_dir" == "$root" ]]; then continue; fi
-        if [[ "$app_dir/" == "$root/" ]]; then continue; fi
-
-        # Identify child app
-        local child_type=$(detect_cms "$app_dir")
-        local rel_path="${app_dir#$root}"
-        
-        # Only report if we successfully identified a known CMS or if it really looks like one
-        if [[ "$child_type" != "Unknown/Custom" ]]; then
-             printf "   |__ [NESTED] %-20s | %-40s\n" "$child_type" "$rel_path"
-        fi
-    done
-}
-
-# ============================================================================
-# MAIN SCANNING LOGIC
-# ============================================================================
-
+# ---------------------------------------------------------------------------
+# 1. System Information
+# ---------------------------------------------------------------------------
 echo "===SECTION:system==="
-echo "hostname=$(hostname 2>/dev/null)"
-echo "timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "hostname=$(hostname 2>/dev/null || echo unknown)"
+echo "kernel=$(uname -r 2>/dev/null || echo unknown)"
+echo "arch=$(uname -m 2>/dev/null || echo unknown)"
+echo "os=$(cat /etc/redhat-release 2>/dev/null || grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || echo unknown)"
+echo "uptime=$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
+echo "load=$(cat /proc/loadavg 2>/dev/null || echo unknown)"
+echo "current_time=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo unknown)"
 
-# 1. Quick Global Filesystem Check (Standard Forensic)
-if [[ -n "$OWNER" ]]; then
-    _hdir=$(getent passwd "$OWNER" 2>/dev/null | cut -d: -f6)
-    [[ -n "$_hdir" && -d "$_hdir" ]] && SCAN_DIRS=("$_hdir")
+# ---------------------------------------------------------------------------
+# 2. Imunify360 Agent
+# ---------------------------------------------------------------------------
+if _run_section "imunify"; then
+echo "===SECTION:imunify==="
+if command -v imunify360-agent &>/dev/null; then
+    echo "installed=yes"
+    imunify360-agent version 2>/dev/null || echo "version=unknown"
+    echo "---features---"
+    imunify360-agent features list 2>/dev/null || echo "features=unavailable"
+    echo "---config---"
+    imunify360-agent config show 2>/dev/null | head -80 || echo "config=unavailable"
+    echo "---signature_db---"
+    cat /var/imunify360/files/sigs/v1/description.json 2>/dev/null || echo "not_found"
+    echo "---default_action---"
+    imunify360-agent config show -v --json 2>/dev/null | grep default_action || echo "unavailable"
+    echo "---sends_file_for_analysis---"
+    imunify360-agent config show -v --json 2>/dev/null | grep sends_file_for_analysis || echo "unavailable"
+    echo "---proactive_defense---"
+    grep PROACTIVE -A5 /etc/sysconfig/imunify360/imunify360-merged.config 2>/dev/null || echo "unavailable"
+    echo "---install_date---"
+    head -20 /var/log/i360deploy.log 2>/dev/null || echo "not_found"
 else
-    for _base in /home /home2 /var/www /var/vhosts /var/www/vhosts; do
+    echo "installed=no"
+fi
+fi
+
+# ---------------------------------------------------------------------------
+# 2b. Discover all hosting accounts
+# ---------------------------------------------------------------------------
+echo "===SECTION:accounts==="
+_SYS_EXACT='root|bin|daemon|adm|lp|sync|shutdown|halt|mail|operator|games|ftp|nobody|dbus|polkitd|sshd|postfix|chrony|ntp|nscd|tcpdump|avahi|mysql|mysqld|postgres|redis|memcached|mongodb|nginx|apache|httpd|www-data|lighttpd|named|dovecot|cyrus|exim|mailman|mailnull|smmsp|clamav|clamupdate|amavis|opendkim|whm|softaculous|solr|tomcat|prosody|varnish|haproxy|plesk|psa|drweb|imunify360|imav-hoster|roundcube|psaadm|psaftp|git|svn|puppet|chef|docker|libvirt|qemu|virtuser|lsadm|litespeed|lscpd|nfsnobody|rpc|rpcuser|saslauth|abrt|setroubleshoot|sssd|gdm|unbound|gluster|ovirt|zabbix|nagios|prometheus|grafana|node_exporter|elasticsearch|kibana|logstash|jenkins|gitlab|deployer|ansible|ec2-user|centos|ubuntu|cloud-user|oprofile'
+_SYS_PREFIX='systemd-|cpanel|ossec|_imunify|imunify360-|sw-cp-|sw-engine|gnome-initial'
+
+declare -a ALL_ACCOUNTS=()
+_acct_count=0
+
+while IFS=: read -r _uname _ _uid _ _ _uhome _; do
+    [[ -z "$_uname" ]] && continue
+    [[ "$_uid" -lt 500 ]] 2>/dev/null && continue
+    echo "$_uname" | grep -qE "^(${_SYS_EXACT})$" && continue
+    echo "$_uname" | grep -qE "^(${_SYS_PREFIX})" && continue
+    [[ -z "$_uhome" || "$_uhome" == "/" || "$_uhome" == "/bin"* || "$_uhome" == "/sbin"* || "$_uhome" == "/usr"* || "$_uhome" == "/dev"* ]] && continue
+
+    _docroot=""
+    for _dr_cand in "${_uhome}/public_html" "${_uhome}/httpdocs" "${_uhome}/htdocs" "${_uhome}/www" "${_uhome}/web" "${_uhome}/public"; do
+        if [[ -d "$_dr_cand" ]]; then _docroot="$_dr_cand"; break; fi
+    done
+    if [[ -z "$_docroot" && -d "/var/www/vhosts" ]]; then
+        for _vd in /var/www/vhosts/*/httpdocs; do
+            [[ -d "$_vd" ]] || continue
+            if [[ "$(stat -c '%U' "$_vd" 2>/dev/null)" == "$_uname" ]]; then _docroot="$_vd"; break; fi
+        done
+    fi
+    _wp="no"
+    if [[ -n "$_docroot" && -f "${_docroot}/wp-config.php" ]]; then _wp="yes"; fi
+
+    echo "account=${_uname}|uid=${_uid}|home=${_uhome}|docroot=${_docroot:-none}|wordpress=${_wp}|home_exists=$([[ -d "$_uhome" ]] && echo yes || echo no)"
+    ALL_ACCOUNTS+=("$_uname")
+    _acct_count=$((_acct_count + 1))
+done < <(getent passwd 2>/dev/null)
+
+if [[ -d /var/cpanel/users ]]; then
+    for _cpf in /var/cpanel/users/*; do
+        [[ -f "$_cpf" ]] || continue
+        _cpuser=$(basename "$_cpf")
+        printf '%s\n' "${ALL_ACCOUNTS[@]}" 2>/dev/null | grep -qx "$_cpuser" && continue
+        _cphome=""
+        for _base in /home /home2; do
+            [[ -d "${_base}/${_cpuser}" ]] && _cphome="${_base}/${_cpuser}" && break
+        done
+        [[ -z "$_cphome" ]] && continue
+        _docroot=""
+        [[ -d "${_cphome}/public_html" ]] && _docroot="${_cphome}/public_html"
+        _wp="no"
+        [[ -n "$_docroot" && -f "${_docroot}/wp-config.php" ]] && _wp="yes"
+        echo "account=${_cpuser}|uid=cpanel|home=${_cphome}|docroot=${_docroot:-none}|wordpress=${_wp}|home_exists=yes"
+        ALL_ACCOUNTS+=("$_cpuser")
+        _acct_count=$((_acct_count + 1))
+    done
+fi
+
+echo "total_accounts=${_acct_count}"
+
+# ---------------------------------------------------------------------------
+# 2c. WordPress Sites Discovery
+# ---------------------------------------------------------------------------
+echo "===SECTION:wordpress_sites==="
+_wp_count=0
+_discover_wp_sites() {
+    local _acctname="$1"
+    local _searchdir="$2"
+    [[ -d "$_searchdir" ]] || return
+    while IFS= read -r _wpcfg; do
+        [[ -z "$_wpcfg" ]] && continue
+        local _wpdir=$(dirname "$_wpcfg")
+        local _ver="unknown"
+        if [[ -f "${_wpdir}/wp-includes/version.php" ]]; then
+            _ver=$(grep -oP "\\\$wp_version\s*=\s*'[^']+'" "${_wpdir}/wp-includes/version.php" 2>/dev/null | grep -oP "'[^']+'" | tr -d "'" || echo "unknown")
+            [[ -z "$_ver" ]] && _ver="unknown"
+        fi
+        local _active="yes"
+        [[ ! -f "${_wpdir}/wp-settings.php" ]] && _active="partial"
+        local _dbpfx
+        _dbpfx=$(grep -m1 'table_prefix' "$_wpcfg" 2>/dev/null | grep -oP "'[^']+'" | head -1 | tr -d "'" || echo "wp_")
+        [[ -z "$_dbpfx" ]] && _dbpfx="wp_"
+        echo "wp_site=${_acctname}|path=${_wpdir}|version=${_ver}|db_prefix=${_dbpfx}|active=${_active}"
+        _wp_count=$((_wp_count + 1))
+    done < <(find "$_searchdir" -maxdepth 5 -name 'wp-config.php' -type f 2>/dev/null)
+}
+if [[ -n "$OWNER" ]]; then
+    _ownerhome=""
+    if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then _ownerhome="$HOMEDIR"; else
+        for _base in /home /home2 /var/www /var/vhosts; do
+            [[ -d "${_base}/${OWNER}" ]] && _ownerhome="${_base}/${OWNER}" && break
+        done
+    fi
+    if [[ -n "$_ownerhome" ]]; then _discover_wp_sites "$OWNER" "$_ownerhome"; fi
+elif [[ ${#ALL_ACCOUNTS[@]} -gt 0 ]]; then
+    while IFS=: read -r _uname _ _ _ _ _uhome _; do
+        [[ -z "$_uname" || -z "$_uhome" ]] && continue
+        printf '%s\n' "${ALL_ACCOUNTS[@]}" 2>/dev/null | grep -qx "$_uname" || continue
+        _discover_wp_sites "$_uname" "$_uhome"
+        [[ $_wp_count -ge 200 ]] && echo "truncated_at_200" && break
+    done < <(getent passwd 2>/dev/null)
+fi
+echo "total_wp_sites=${_wp_count}"
+
+# ---------------------------------------------------------------------------
+# 3. User / Account Info
+# ---------------------------------------------------------------------------
+if _run_section "user_info"; then
+echo "===SECTION:user_info==="
+if [[ -n "$OWNER" ]]; then
+    echo "owner=$OWNER"
+    HOMEDIR=""
+    for base in /home /home2 /var/www /var/vhosts; do
+        if [[ -d "${base}/${OWNER}" ]]; then HOMEDIR="${base}/${OWNER}"; break; fi
+    done
+    if [[ -z "$HOMEDIR" ]]; then HOMEDIR=$(getent passwd "$OWNER" 2>/dev/null | cut -d: -f6); HOMEDIR="${HOMEDIR:-}"; fi
+    if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
+        echo "home=$HOMEDIR"
+        echo "disk_usage=$(du -sh "$HOMEDIR" 2>/dev/null | awk '{print $1}' || echo unknown)"
+        echo "---home_listing---"
+        ls -la "$HOMEDIR" 2>/dev/null | head -50
+    else
+        echo "home=not_found"
+    fi
+    echo "---crontab---"
+    crontab -l -u "$OWNER" 2>/dev/null || echo "no_crontab"
+    echo "---recent_php_files---"
+    if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
+        find "$HOMEDIR" -name '*.php' -mtime -7 -type f ! -path '*/cache/*' ! -path '*/vendor/*' ! -path '*/node_modules/*' -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -60 | $_AWK '{printf "%s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3}'
+    fi
+    echo "---suspicious_files---"
+    if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
+        find "$HOMEDIR" -type f -name '*.php' \( -path '*/uploads/*' -o -path '*/upload/*' -o -path '*/tmp/*' \) -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -30 | $_AWK '{printf "%s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3}'
+        find "$HOMEDIR" -maxdepth 4 -type f -path '*/.*/*' ! -path '*/.git/*' ! -path '*/.npm/*' ! -path '*/.cache/*' ! -path '*/.cpanel/*' ! -path '*/.local/*' ! -path '*/.config/*' ! -path '*/.composer/*' ! -path '*/.wp-cli/*' -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -30 | $_AWK '{printf "%s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3}'
+    fi
+    echo "---world_writable---"
+    if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
+        find "$HOMEDIR" -maxdepth 5 -type f -perm -o+w ! -path '*/cache/*' ! -path '*/tmp/*' ! -path '*/logs/*' -printf '%m %s %p\n' 2>/dev/null | head -30
+    fi
+else
+    echo "owner=not_specified"
+fi
+fi
+
+# Resolve HOMEDIR if not set
+if [[ -n "$OWNER" && -z "$HOMEDIR" ]]; then
+    for _base in /home /home2 /var/www /var/vhosts; do
+        if [[ -d "${_base}/${OWNER}" ]]; then HOMEDIR="${_base}/${OWNER}"; break; fi
+    done
+    if [[ -z "$HOMEDIR" ]]; then HOMEDIR=$(getent passwd "$OWNER" 2>/dev/null | cut -d: -f6); HOMEDIR="${HOMEDIR:-}"; fi
+fi
+
+# Build SCAN_DIRS
+SCAN_DIRS=()
+OWNER_FILTER=()
+if [[ -n "$OWNER" ]]; then
+    OWNER_FILTER=(-user "$OWNER")
+    if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then SCAN_DIRS=("$HOMEDIR"); else
+        _hdir=$(getent passwd "$OWNER" 2>/dev/null | cut -d: -f6)
+        if [[ -n "$_hdir" && -d "$_hdir" ]]; then SCAN_DIRS=("$_hdir"); fi
+    fi
+else
+    for _base in /home /home2 /var/www /var/vhosts; do
         [[ -d "$_base" ]] && SCAN_DIRS+=("$_base")
     done
 fi
 
-echo "===SECTION:filesystem_quick==="
+# ---------------------------------------------------------------------------
+# Filesystem Scans (Hidden, Recent PHP, Strange, Permissions, Root, CageFS, Sigs)
+# ---------------------------------------------------------------------------
+if _run_section "filesystem"; then
+echo "===SECTION:hidden_files==="
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
-    echo "---recent_php_files_7days (Limit 50)---"
-    find "${SCAN_DIRS[@]}" -maxdepth 4 -type f -name '*.php' -mtime -7 \
-        ! -path '*/cache/*' ! -path '*/vendor/*' \
-        -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -50 | \
-        $_AWK '{printf "%s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3}'
+    echo "---hidden_files_recent---"
+    find "${SCAN_DIRS[@]}" -maxdepth 6 -type f -name '.*' -mtime -30 ! -path '*/.git/*' ! -path '*/.npm/*' ! -path '*/.cache/*' ! -path '*/.cpanel/*' ! -path '*/.local/*' ! -path '*/.config/*' ! -path '*/.composer/*' ! -path '*/.wp-cli/*' ! -path '*/.ssh/*' ! -path '*/.gnupg/*' ! -path '*/.pki/*' ! -path '*/.nvm/*' ! -path '*/.yarn/*' ! -path '*/.rvm/*' ! -path '*/.cagefs/*' ! -path '*/.cl.selector/*' ! -path '*/.passenger/*' ! -path '*/.softaculous/*' ! -path '*/.trash/*' ! -path '*/.Trash/*' ! -path '*/.rapid-scan-db/*' ! -path '*/.skel/*' ! -path '*/.wp-toolkit/*' ! -path '*/.webstat/*' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -name '.bashrc' ! -name '.bash_profile' ! -name '.bash_history' ! -name '.bash_logout' ! -name '.profile' ! -name '.htaccess' ! -name '.gitignore' ! -name '.DS_Store' ! -name '.env' ! -name '.imunify_patch_id' ! -name '.myimunify_id' ! -name '.php-version' ! -name '.php-ini' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    echo "---files_inside_hidden_dirs---"
+    find "${SCAN_DIRS[@]}" -maxdepth 6 -type f -path '*/.*/*' ! -path '*/.git/*' ! -path '*/.npm/*' ! -path '*/.cache/*' ! -path '*/.cpanel/*' ! -path '*/.local/*' ! -path '*/.config/*' ! -path '*/.composer/*' ! -path '*/.wp-cli/*' ! -path '*/.ssh/*' ! -path '*/.gnupg/*' ! -path '*/.pki/*' ! -path '*/.nvm/*' ! -path '*/.yarn/*' ! -path '*/.rvm/*' ! -path '*/.cagefs/*' ! -path '*/.cl.selector/*' ! -path '*/.passenger/*' ! -path '*/.softaculous/*' ! -path '*/.trash/*' ! -path '*/.Trash/*' ! -path '*/.gem/*' ! -path '*/.bundle/*' ! -path '*/.rapid-scan-db/*' ! -path '*/.skel/*' ! -path '*/.wp-toolkit/*' ! -path '*/.webstat/*' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
 else
-    echo "No standard directories found to scan."
+    echo "no_scan_dirs_found"
 fi
 
-# 2. Logs
+echo "===SECTION:recent_php==="
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    if [[ -n "$OWNER" ]]; then
+        find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '*.php' -mtime -7 -user "$OWNER" ! -path '*/cache/*' ! -path '*/vendor/*' ! -path '*/node_modules/*' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -300 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    else
+        find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '*.php' -mtime -7 ! -path '*/cache/*' ! -path '*/vendor/*' ! -path '*/node_modules/*' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -300 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    fi
+else
+    echo "no_scan_dirs_found"
+fi
+
+echo "===SECTION:php_in_uploads==="
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    if [[ -n "$OWNER" ]]; then
+        find "${SCAN_DIRS[@]}" -maxdepth 10 -type f -name '*.php*' -path '*/wp-content/uploads/*' -user "$OWNER" ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    else
+        find "${SCAN_DIRS[@]}" -maxdepth 10 -type f -name '*.php*' -path '*/wp-content/uploads/*' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    fi
+else
+    echo "no_scan_dirs_found"
+fi
+
+echo "===SECTION:strange_php==="
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    if [[ -n "$OWNER" ]]; then
+        find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -user "$OWNER" \( -regex '.*/[a-z0-9]\{32\}\.php' -o -regex '.*/[a-f0-9]\{8,16\}\.php' -o -regex '.*/\.[a-z0-9]\{6,\}\.php' -o -regex '.*/[0-9]\{5,\}\.php' \) ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    else
+        find "${SCAN_DIRS[@]}" -maxdepth 8 -type f \( -regex '.*/[a-z0-9]\{32\}\.php' -o -regex '.*/[a-f0-9]\{8,16\}\.php' -o -regex '.*/\.[a-z0-9]\{6,\}\.php' -o -regex '.*/[0-9]\{5,\}\.php' \) ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    fi
+else
+    echo "no_scan_dirs_found"
+fi
+
+echo "===SECTION:permissions==="
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    echo "---world_writable---"
+    if [[ -n "$OWNER" ]]; then
+        find "${SCAN_DIRS[@]}" -maxdepth 8 -user "$OWNER" -perm -o+w ! -path '*/cache/*' ! -path '*/tmp/*' ! -path '*/logs/*' ! -path '*/reports/*.log' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' -printf '%m %T@ %u %s %p\n' 2>/dev/null | sort -k2 -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", $1, strftime("%Y-%m-%d %H:%M:%S", $2), $3, $4, $5}'
+    else
+        find "${SCAN_DIRS[@]}" -maxdepth 8 -perm -o+w ! -path '*/cache/*' ! -path '*/tmp/*' ! -path '*/logs/*' ! -path '*/reports/*.log' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' -printf '%m %T@ %u %s %p\n' 2>/dev/null | sort -k2 -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", $1, strftime("%Y-%m-%d %H:%M:%S", $2), $3, $4, $5}'
+    fi
+    echo "---not_owned_by_user---"
+    if [[ -n "$OWNER" ]]; then
+        find "${SCAN_DIRS[@]}" -maxdepth 8 ! -user "$OWNER" ! -path '*/cache/*' ! -path '*/vendor/*' ! -path '*/node_modules/*' ! -path '*/reports/*.log' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' ! -user root ! -user nobody -printf '%m %T@ %u %s %p\n' 2>/dev/null | sort -k2 -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", $1, strftime("%Y-%m-%d %H:%M:%S", $2), $3, $4, $5}'
+    else
+        echo "skipped_no_owner"
+    fi
+else
+    echo "no_scan_dirs_found"
+fi
+
+echo "===SECTION:root_files==="
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    if [[ -n "$OWNER" && -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
+        find "$HOMEDIR" -maxdepth 8 -user root -type f ! -path '*/.cagefs/*' ! -path '*/.cl.selector/*' ! -path '*/.cpanel/*' ! -path '*/.passenger/*' ! -path '*/chroot/*' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' ! -path '*/logs/access*' ! -path '*/logs/proxy*' ! -name 'access_ssl_log' ! -path '*/.webstat/*' ! -name '.bashrc' ! -name '.bash_profile' ! -name '.bash_logout' -printf '%T@ %s %m %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4}'
+    else
+        find "${SCAN_DIRS[@]}" -maxdepth 6 -user root -type f ! -path '*/.cagefs/*' ! -path '*/.cl.selector/*' ! -path '*/.cpanel/*' ! -path '*/.passenger/*' ! -path '*/chroot/*' ! -path '*/vhosts/system/*' ! -path '*/error_docs/*' ! -path '*/.rapid-scan-db/*' ! -path '*/logs/access*' ! -path '*/logs/proxy*' ! -name 'access_ssl_log' ! -path '*/.webstat/*' ! -name '.bashrc' ! -name '.bash_profile' ! -name '.bash_logout' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    fi
+else
+    echo "no_scan_dirs_found"
+fi
+
+echo "===SECTION:php_in_cagefs==="
+if [[ -n "$OWNER" && -n "$HOMEDIR" && -d "${HOMEDIR}/.cagefs" ]]; then
+    find "${HOMEDIR}/.cagefs" -maxdepth 8 -type f -name '*.php*' -printf '%T@ %s %m %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4}'
+elif [[ -z "$OWNER" ]]; then
+    for _base in /home /home2; do
+        [[ -d "$_base" ]] || continue
+        find "$_base" -maxdepth 6 -type f -name '*.php*' -path '*/.cagefs/*' -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -200 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    done
+else
+    echo "no_cagefs_dir"
+fi
+
+echo "===SECTION:malware_signatures==="
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    echo "---obfuscated_php---"
+    find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '*.php' ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | xargs -0 grep -lE '(eval\s*\(\s*(base64_decode|gzinflate|gzuncompress|str_rot13|strrev|hex2bin)|assert\s*\(\s*\$|preg_replace\s*\(.*/e)' 2>/dev/null | head -100 || echo "none"
+    echo "---known_webshells---"
+    find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '*.php' ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | xargs -0 grep -lE '(c99shell|r57shell|WSO |FilesMan|b374k|phpspy|webadmin.*shell|Meterpreter|@fsockopen\(|passthru\s*\(|shell_exec\s*\(|system\s*\(\$_(GET|POST|REQUEST)|pcntl_exec)' 2>/dev/null | head -100 || echo "none"
+    echo "---long_oneliner_php---"
+    find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '*.php' ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -exec awk 'NR==1 && length>5000 && /^<\?php/ {print FILENAME}' {} + 2>/dev/null | head -100 || echo "none"
+    echo "---seo_crypto_injections---"
+    find "${SCAN_DIRS[@]}" -maxdepth 8 -type f \( -name '*.php' -o -name '*.html' -o -name '*.js' \) ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | xargs -0 grep -lE '(<script[^>]*src=.*(\/min\.js|\/stat\.js|\/analytics\.js|evil|malware)|document\.write\(unescape|String\.fromCharCode|coinhive|cryptonight|eval\(atob)' 2>/dev/null | head -100 || echo "none"
+else
+    echo "no_scan_dirs_found"
+fi
+
+echo "===SECTION:cloaked_images==="
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    _IMG_PATHS=( "*/uploads/*" "*/images/*" "*/img/*" "*/media/*" "*/gallery/*" "*/photos/*" "*/pics/*" "*/assets/*" "*/files/*" "*/content/*" )
+    _IMG_PATH_ARGS=()
+    for _ip in "${_IMG_PATHS[@]}"; do
+        if [[ ${#_IMG_PATH_ARGS[@]} -eq 0 ]]; then _IMG_PATH_ARGS+=( -path "$_ip" ); else _IMG_PATH_ARGS+=( -o -path "$_ip" ); fi
+    done
+    echo "---php_in_images---"
+    find "${SCAN_DIRS[@]}" -maxdepth 8 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.ico' -o -iname '*.webp' -o -iname '*.svg' -o -iname '*.tiff' -o -iname '*.tif' \) ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | xargs -0 grep -rlP '<\?php|<\?=|<\?\s' 2>/dev/null | head -100 || echo "none"
+    echo "---html_in_images---"
+    find "${SCAN_DIRS[@]}" -maxdepth 8 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.ico' -o -iname '*.webp' \) ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | xargs -0 grep -rlEi '<!DOCTYPE|<html|<script|<iframe|document\.write|eval\s*\(' 2>/dev/null | head -100 || echo "none"
+    echo "---double_extension---"
+    find "${SCAN_DIRS[@]}" -maxdepth 8 -type f ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} \( -iname '*.php.jpg' -o -iname '*.php.jpeg' -o -iname '*.php.png' -o -iname '*.php.gif' -o -iname '*.php.ico' -o -iname '*.php.webp' -o -iname '*.php.bmp' -o -iname '*.jpg.php' -o -iname '*.jpeg.php' -o -iname '*.png.php' -o -iname '*.gif.php' -o -iname '*.ico.php' -o -iname '*.webp.php' -o -iname '*.bmp.php' -o -iname '*.php.svg' -o -iname '*.svg.php' -o -iname '*.phtml.jpg' -o -iname '*.phtml.png' -o -iname '*.phtml.gif' -o -iname '*.jpg.phtml' -o -iname '*.png.phtml' -o -iname '*.gif.phtml' -o -iname '*.php5.jpg' -o -iname '*.php7.jpg' \) -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -100 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+    [[ ${PIPESTATUS[0]} -ne 0 ]] || true
+    echo "---image_type_mismatch---"
+    if command -v file &>/dev/null; then
+        find "${SCAN_DIRS[@]}" -maxdepth 8 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.ico' -o -iname '*.webp' -o -iname '*.bmp' \) \( "${_IMG_PATH_ARGS[@]}" \) ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | xargs -0 -P2 -n50 file --mime-type 2>/dev/null | grep -viE '(image/|application/octet-stream|cannot open)' | head -100 || echo "none"
+    else
+        echo "file_command_not_available"
+    fi
+    echo "---large_images_with_code---"
+    find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -size +500k \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' \) \( "${_IMG_PATH_ARGS[@]}" \) ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | xargs -0 grep -rlP '(eval\s*\(|base64_decode|gzinflate|assert\s*\(|passthru|shell_exec|system\s*\()' 2>/dev/null | head -50 || echo "none"
+else
+    echo "no_scan_dirs_found"
+fi
+
+echo "===SECTION:htaccess==="
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '.htaccess' ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -exec echo "---{}---" \; -exec cat {} \; 2>/dev/null | head -5000 || echo "none"
+else
+    echo "no_scan_dirs_found"
+fi
+
+echo "===SECTION:crontabs==="
+if [[ -n "$OWNER" ]]; then
+    echo "---user_spool---"
+    for f in "/var/spool/cron/${OWNER}" "/var/spool/cron/crontabs/${OWNER}"; do
+        if [[ -f "$f" ]]; then echo "---${f}---"; cat "$f" 2>/dev/null || echo "unreadable"; fi
+    done
+    echo "---etc_crontab_user---"
+    grep -n "$OWNER" /etc/crontab 2>/dev/null || echo "no_matches"
+    echo "---cron_d_user---"
+    for f in /etc/cron.d/*; do
+        [[ -f "$f" ]] || continue
+        matches=$(grep -c "$OWNER" "$f" 2>/dev/null || echo "0")
+        if [[ "$matches" -gt 0 ]]; then echo "---${f}---"; grep -n "$OWNER" "$f" 2>/dev/null; fi
+    done
+else
+    echo "---etc_crontab---"
+    cat /etc/crontab 2>/dev/null || echo "not_found"
+    echo "---cron_d---"
+    for f in /etc/cron.d/*; do [[ -f "$f" ]] || continue; echo "---${f}---"; cat "$f" 2>/dev/null || echo "unreadable"; done
+    echo "---spool_crontabs---"
+    for f in /var/spool/cron/* /var/spool/cron/crontabs/*; do [[ -f "$f" ]] || continue; echo "---${f}---"; cat "$f" 2>/dev/null || echo "unreadable"; done
+fi
+fi # end filesystem
+
+# ---------------------------------------------------------------------------
+# 4. Domain Info (Updated inspect_domain and resolve_docroot with new logic)
+# ---------------------------------------------------------------------------
+inspect_domain() {
+    local _domain="$1"
+    local _docroot="$2"
+    echo "---domain:${_domain}---"
+    echo "document_root=$_docroot"
+    echo "disk_usage=$(du -sh "$_docroot" 2>/dev/null | awk '{print $1}' || echo unknown)"
+    if [[ -f "${_docroot}/wp-config.php" ]]; then
+        echo "wordpress=yes"
+        local _wpver=$(grep 'wp_version\s*=' "${_docroot}/wp-includes/version.php" 2>/dev/null | grep -oP "'[^']+'" | tr -d "'" || echo "unknown")
+        echo "wp_version=$_wpver"
+        local _dbpfx=$(grep 'table_prefix' "${_docroot}/wp-config.php" 2>/dev/null | grep -oP "'[^']+'" | head -1 || echo "wp_")
+        echo "wp_db_prefix=$_dbpfx"
+        local _wpdebug=$(grep 'WP_DEBUG' "${_docroot}/wp-config.php" 2>/dev/null | head -1 || echo "not_set")
+        echo "wp_debug=$_wpdebug"
+    else
+        echo "wordpress=no"
+    fi
+    echo "---docroot_listing:${_domain}---"
+    ls -la "$_docroot" 2>/dev/null | head -40
+    if [[ -f "${_docroot}/wp-config.php" ]] && command -v wp &>/dev/null; then
+        local -a _wp=(wp "--path=${_docroot}" --no-color --allow-root)
+        echo "---wp_verify_checksums:${_domain}---"
+        "${_wp[@]}" core verify-checksums 2>&1 | head -200 || echo "unavailable"
+        echo "---wp_plugin_list:${_domain}---"
+        "${_wp[@]}" plugin list --format=table 2>/dev/null | head -100 || echo "unavailable"
+        echo "---wp_theme_list:${_domain}---"
+        "${_wp[@]}" theme list --format=table 2>/dev/null | head -50 || echo "unavailable"
+        echo "---wp_admin_users:${_domain}---"
+        "${_wp[@]}" user list --role=administrator --format=table 2>/dev/null | head -50 || echo "unavailable"
+        echo "---wp_cron_events:${_domain}---"
+        "${_wp[@]}" cron event list --format=table 2>/dev/null | head -100 || echo "unavailable"
+    fi
+}
+
+discover_account_domains() {
+    local _owner="$1"
+    local _domains=()
+    local _hdir="${HOMEDIR:-}"
+    if [[ -z "$_hdir" ]]; then _hdir=$(getent passwd "$_owner" 2>/dev/null | cut -d: -f6); fi
+    if [[ -f "/var/cpanel/users/${_owner}" ]]; then
+        while IFS= read -r line; do _domains+=("$line"); done < <(grep -oP '(?<=DNS=|DNS\d*=)\S+' "/var/cpanel/users/${_owner}" 2>/dev/null)
+    fi
+    if [[ -d "/var/www/vhosts" ]]; then
+        for d in /var/www/vhosts/*/httpdocs; do
+            [[ -d "$d" ]] || continue
+            local _vdom=$(basename "$(dirname "$d")")
+            if [[ "$(stat -c '%U' "$d" 2>/dev/null)" == "$_owner" ]]; then _domains+=("$_vdom"); fi
+        done
+    fi
+    if [[ -f "/usr/local/directadmin/data/users/${_owner}/domains.list" ]]; then
+        while IFS= read -r line; do [[ -n "$line" ]] && _domains+=("$line"); done < "/usr/local/directadmin/data/users/${_owner}/domains.list"
+    fi
+    if [[ ${#_domains[@]} -eq 0 && -n "$_hdir" && -d "$_hdir" ]]; then
+        while IFS= read -r wpconf; do
+            local _dr=$(dirname "$wpconf")
+            local _dname=$(basename "$_dr")
+            [[ "$_dname" == "public_html" ]] && _dname=$(basename "$(dirname "$_dr")")
+            _domains+=("$_dname|$_dr")
+        done < <(find "$_hdir" -maxdepth 4 -name 'wp-config.php' -type f 2>/dev/null)
+    fi
+    if [[ ${#_domains[@]} -gt 0 ]]; then printf '%s\n' "${_domains[@]}" | sort -u; fi
+}
+
+if _run_section "domain_info"; then
+echo "===SECTION:domain_info==="
+if [[ -n "$DOMAIN" ]]; then
+    DOCROOT=$(resolve_docroot "$DOMAIN")
+    if [[ -n "$DOCROOT" && -d "$DOCROOT" ]]; then inspect_domain "$DOMAIN" "$DOCROOT"
+    else echo "domain=$DOMAIN"; echo "document_root=not_found"; fi
+elif [[ -n "$OWNER" ]]; then
+    echo "mode=auto_discover"; echo "owner=$OWNER"; _found=0
+    while IFS= read -r _entry; do
+        [[ -z "$_entry" ]] && continue
+        if [[ "$_entry" == *"|"* ]]; then
+            _dname="${_entry%%|*}"; _dpath="${_entry##*|}"
+            if [[ -d "$_dpath" ]]; then inspect_domain "$_dname" "$_dpath"; _found=$((_found + 1)); fi
+        else
+            _dr=$(resolve_docroot "$_entry")
+            if [[ -n "$_dr" && -d "$_dr" ]]; then inspect_domain "$_entry" "$_dr"; _found=$((_found + 1))
+            else echo "---domain:${_entry}---"; echo "document_root=not_found"; fi
+        fi
+    done < <(discover_account_domains "$OWNER")
+    echo "domains_found=$_found"
+else
+    echo "mode=all_accounts"; _found=0
+    if [[ ${#ALL_ACCOUNTS[@]} -gt 0 ]]; then
+        for _acct in "${ALL_ACCOUNTS[@]}"; do
+            while IFS= read -r _entry; do
+                [[ -z "$_entry" ]] && continue
+                if [[ "$_entry" == *"|"* ]]; then
+                    _dname="${_entry%%|*}"; _dpath="${_entry##*|}"
+                    if [[ -d "$_dpath" ]]; then inspect_domain "$_dname" "$_dpath"; _found=$((_found + 1)); fi
+                else
+                    _dr=$(resolve_docroot "$_entry"); if [[ -n "$_dr" && -d "$_dr" ]]; then inspect_domain "$_entry" "$_dr"; _found=$((_found + 1)); fi
+                fi
+            done < <(discover_account_domains "$_acct")
+            [[ $_found -ge 50 ]] && echo "truncated_at_50_domains" && break
+        done
+    fi
+    echo "domains_found=$_found"
+fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Imunify360 local SQLite databases
+# ---------------------------------------------------------------------------
+if _run_section "imunify_db"; then
+echo "===SECTION:imunify_db==="
+SQLITE="/opt/alt/sqlite/usr/bin/sqlite3"
+RESDB="/var/imunify360/imunify360-resident.db"
+MAINDB="/var/imunify360/imunify360.db"
+if [[ -x "$SQLITE" ]]; then
+    echo "---incident_by_plugin---"; echo "select plugin, count(*) from incident group by plugin;" | "$SQLITE" "$RESDB" 2>/dev/null || echo "unavailable"
+    echo "---incident_recent---"; echo "select * from incident order by timestamp desc limit 1000;" | "$SQLITE" "$RESDB" 2>/dev/null || echo "unavailable"
+    echo "---malware_hits---"; echo "select * from malware_hits limit 1000;" | "$SQLITE" "$MAINDB" 2>/dev/null || echo "unavailable"
+    echo "---malware_ignore_path---"; echo "select * from malware_ignore_path limit 1000;" | "$SQLITE" "$MAINDB" 2>/dev/null || echo "unavailable"
+    echo "---malware_scans---"; echo "select * from malware_scans limit 1000;" | "$SQLITE" "$MAINDB" 2>/dev/null || echo "unavailable"
+else echo "sqlite3_not_found"; fi
+fi
+
+if _run_section "imunify_db"; then
+echo "===SECTION:malware_scans==="
+if command -v imunify360-agent &>/dev/null; then
+    echo "---malware_history---"
+    if [[ -n "$OWNER" ]]; then imunify360-agent malware history list --user "$OWNER" --limit 25 2>/dev/null || echo "history=unavailable"
+    else imunify360-agent malware history list --limit 25 2>/dev/null || echo "history=unavailable"; fi
+    echo "---infected_files---"
+    if [[ -n "$OWNER" ]]; then imunify360-agent malware malicious list --user "$OWNER" --limit 25 2>/dev/null || echo "malicious=unavailable"
+    else imunify360-agent malware malicious list --limit 25 2>/dev/null || echo "malicious=unavailable"; fi
+else echo "imunify_not_installed"; fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Active connections & suspicious processes
+# ---------------------------------------------------------------------------
+if _run_section "network"; then
+OWNER_UID=""; echo "===SECTION:network==="; echo "---outbound_connections---"
+if [[ -n "$OWNER" ]]; then
+    OWNER_UID=$(id -u "$OWNER" 2>/dev/null || echo "")
+    if [[ -n "$OWNER_UID" ]]; then ss -tunp 2>/dev/null | grep "uid:${OWNER_UID}" | head -30 || echo "none"; else echo "user_uid_unknown"; fi
+else ss -tunp 2>/dev/null | grep -v '127.0.0.1' | grep ESTAB | head -40 || echo "none"; fi
+echo "---netstat_all---"; netstat -tulpan 2>/dev/null | tail -n 3000 || echo "netstat_unavailable"
+echo "---netstat_count---"; netstat -tulpan 2>/dev/null | wc -l || echo "0"
+echo "---netstat_listening---"; netstat -tlpn 2>/dev/null || echo "netstat_unavailable"
+echo "---suspicious_processes---"
+if [[ -n "$OWNER" ]]; then ps -u "$OWNER" -o pid,ppid,cmd,%cpu,%mem,etime --sort=-%cpu 2>/dev/null | head -20 || echo "none"
+else ps aux 2>/dev/null | grep -iE 'perl|python.*base64|wget.*sh|curl.*sh|nc\s+-|ncat|cryptominer|xmrig|minerd|kswapd[0-9]|kworker.*deleted|wpboost|ld-linux.*deleted|/var/tmp/|/dev/shm/|memfd:|\.hide|/tmp/\.' | grep -v grep | head -30 || echo "none"; fi
+fi
+
+# ---------------------------------------------------------------------------
+# 7. In-memory malware detection
+# ---------------------------------------------------------------------------
+if _run_section "inmemory"; then
+echo "===SECTION:inmemory_malware==="
+echo "---deleted_binaries---"
+for pid_dir in /proc/[0-9]*; do
+    pid="${pid_dir##*/}"; exe_link=$(readlink "${pid_dir}/exe" 2>/dev/null || echo "")
+    if [[ "$exe_link" == *"(deleted)"* ]]; then
+        cmd=$(tr '\0' ' ' < "${pid_dir}/cmdline" 2>/dev/null | head -c 200 || echo ""); owner_uid=$(awk '/^Uid:/{print $2}' "${pid_dir}/status" 2>/dev/null || echo "?"); owner_name=$(getent passwd "$owner_uid" 2>/dev/null | cut -d: -f1 || echo "uid:${owner_uid}")
+        echo "pid=${pid}|exe=${exe_link}|user=${owner_name}|cmd=${cmd}"
+    fi
+done 2>/dev/null
+echo "---dev_shm---"; ls -la /dev/shm/ 2>/dev/null | grep -v '^total' | grep -v '^d' | head -30 || echo "empty"
+echo "---memfd_processes---"
+for pid_dir in /proc/[0-9]*; do
+    pid="${pid_dir##*/}"; found_memfd=""
+    for fd in "${pid_dir}/fd"/*; do target=$(readlink "$fd" 2>/dev/null || echo ""); if [[ "$target" == *"/memfd:"* || "$target" == *"memfd:"* ]]; then found_memfd="${found_memfd}${target}; "; fi; done 2>/dev/null
+    if [[ -n "$found_memfd" ]]; then
+        cmd=$(tr '\0' ' ' < "${pid_dir}/cmdline" 2>/dev/null | head -c 200 || echo ""); owner_uid=$(awk '/^Uid:/{print $2}' "${pid_dir}/status" 2>/dev/null || echo "?"); owner_name=$(getent passwd "$owner_uid" 2>/dev/null | cut -d: -f1 || echo "uid:${owner_uid}")
+        echo "pid=${pid}|user=${owner_name}|memfd=${found_memfd}|cmd=${cmd}"
+    fi
+done 2>/dev/null
+echo "---tmp_executables---"
+find /tmp -maxdepth 2 -type f \( -perm -u+x -o -name '*.sh' -o -name '*.pl' -o -name '*.py' \) -printf '%T@ %u %s %m %p\n' 2>/dev/null | sort -rn | head -20 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+find /tmp -maxdepth 2 -type f -mtime -7 -regex '.*/[a-zA-Z0-9]\{6,\}$' -printf '%T@ %u %s %m %p\n' 2>/dev/null | sort -rn | head -20 | $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
+echo "---high_cpu_processes---"
+ps -eo pid,user,%cpu,%mem,etime,args --sort=-%cpu 2>/dev/null | awk 'NR==1 || ($3+0 > 5.0 && $2 != "root" && $2 != "mysql" && $2 != "named")' | head -15 || echo "none"
+echo "---hicpu_fd_details---"
+if [[ -n "$OWNER" ]]; then OWNER_UID=$(id -u "$OWNER" 2>/dev/null || echo ""); fi
+for pid in $(ps -eo pid,%cpu,user --sort=-%cpu 2>/dev/null | awk -v ou="${OWNER_UID:-}" 'NR>1 && $2+0 > 10.0 { if (ou == "" || $3 != "root") print $1 }' | head -5); do
+    echo "---pid:${pid}---"; exe=$(readlink "/proc/${pid}/exe" 2>/dev/null || echo "unknown"); cmd=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | head -c 300 || echo "unknown")
+    owner_uid=$(awk '/^Uid:/{print $2}' "/proc/${pid}/status" 2>/dev/null || echo "?"); owner_name=$(getent passwd "$owner_uid" 2>/dev/null | cut -d: -f1 || echo "uid:${owner_uid}")
+    echo "exe=${exe}"; echo "cmd=${cmd}"; echo "user=${owner_name}"
+    grep -vE 'lib(c|pthread|dl|m|rt|nss|resolv|crypt|z\.|ssl|crypto|pcre|xml|curl|gmp|icu)' "/proc/${pid}/maps" 2>/dev/null | grep -v '\[' | awk '{print $NF}' | sort -u | head -20 || echo "maps=unavailable"
+    ls -la "/proc/${pid}/fd" 2>/dev/null | grep -v '/dev/null\|/dev/pts\|pipe:\|socket:\|anon_inode' | head -20 || echo "fds=unavailable"
+done 2>/dev/null
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Malware Log
+# ---------------------------------------------------------------------------
+if _run_section "malware_log"; then
+echo "===SECTION:malware_log_extract==="
+if [[ -f /var/log/imunify360/console.log ]]; then
+    grep -oP "'[^']+': \{'[^']+': \{'hits': \[\{'matches': '[^']+', '\w+': \w+, '[^']+': \w+, '\w+': \d+\}\], 'size': \d+, 'hash': '[\\w]+'" /var/log/imunify360/console.log 2>/dev/null | tail -3000 || echo "no_matches"
+else echo "console_log_not_found"; fi
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Logs (UPDATED with filtering logic)
+# ---------------------------------------------------------------------------
+if _run_section "logs"; then
 echo "===SECTION:logs==="
 grep_pattern=""
-if [[ -n "$FINAL_TARGETS" ]]; then
-    grep_pattern="${FINAL_TARGETS//,/|}"
+if [[ -n "$TARGET_DOMAINS" ]]; then
+    grep_pattern="${TARGET_DOMAINS//,/|}"
     echo "Log Filter Active: $grep_pattern"
 fi
-
-for logfile in /var/log/imunify360/console.log /var/log/httpd/error_log /var/log/nginx/error.log /usr/local/apache/logs/error_log; do
-    if [[ -f "$logfile" ]]; then
-        echo "---${logfile}---"
-        if [[ -n "$grep_pattern" ]]; then
-            grep -E "$grep_pattern" "$logfile" 2>/dev/null | tail -n 100 || echo "No matches found"
-        else
-            tail -n 100 "$logfile" 2>/dev/null
-        fi
+for logfile in \
+    /var/log/imunify360/console.log \
+    /var/log/imunify360/debug.log \
+    /var/log/imunify360/network.log \
+    /var/log/imunify360/error.log \
+    /var/log/imunify360-webshield/access.log \
+    /var/log/imunify360-webshield/error.log \
+    /var/log/ossec/logs/alerts/alerts.log \
+    /var/log/ossec/logs/active-responses.log \
+    /var/log/i360deploy.log \
+    /var/log/imav-deploy.log \
+    /usr/local/directadmin/custombuild/custombuild.log \
+    /var/log/patchman/patchman.log \
+    /usr/local/apache/logs/error_log \
+    /usr/local/apache/logs/access_log \
+    /usr/local/apache/logs/modsec_audit.log \
+    /etc/apache2/logs/modsec_audit.log \
+    /var/log/httpd/modsec_audit.log \
+    /var/log/httpd/error_log \
+    /var/log/httpd/access_log \
+    /var/log/nginx/error.log \
+    /var/log/nginx/access.log \
+    /var/www/vhosts/system/*/logs/error_log; do
+    
+    [[ -f "$logfile" ]] || continue
+    echo "---${logfile}---"
+    if [[ -n "$grep_pattern" ]]; then
+        grep -E "$grep_pattern" "$logfile" 2>/dev/null | tail -n 3000 || echo "no_matches"
+    else
+        tail -n 3000 "$logfile" 2>/dev/null || echo "not_found_or_empty"
     fi
 done
+fi
 
 # ============================================================================
-# FINAL SUMMARY: UNIVERSAL NESTED DISCOVERY
+# NEW SECTION: TARGET SUMMARY (ADDED AT THE END)
 # ============================================================================
 echo ""
 echo "===SECTION:target_summary==="
 echo "Timestamp: $(date -u)"
 
-if [[ -z "$FINAL_TARGETS" ]]; then
-    echo "No specific domains targeted."
+if [[ -z "$TARGET_DOMAINS" ]]; then
+    echo "No specific domains targeted for Summary. Pass --domains or --domain to use this feature."
 else
     echo "----------------------------------------------------------------------------------------------------"
     printf "%-30s | %-25s | %-40s\n" "DOMAIN/PATH" "APPLICATION" "LOCATION"
     echo "----------------------------------------------------------------------------------------------------"
-
-    IFS=',' read -ra DOM_ARRAY <<< "$FINAL_TARGETS"
-    
+    IFS=',' read -ra DOM_ARRAY <<< "$TARGET_DOMAINS"
     for d in "${DOM_ARRAY[@]}"; do
         d=$(echo "$d" | xargs)
-        
-        # 1. Resolve Root (Universal Method)
         docroot=$(resolve_docroot "$d")
-        
-        # 2. Detect Main App
         if [[ "$docroot" == "NOT_FOUND" ]]; then
             app_type="Path not found"
         else
             app_type=$(detect_cms "$docroot")
         fi
-        
-        # 3. Print Main Row
         printf "%-30s | %-25s | %-40s\n" "$d" "$app_type" "$docroot"
         
-        # 4. Deep Recursion for Nested Apps
+        # Deep recursion for Nested Apps
         if [[ "$docroot" != "NOT_FOUND" ]]; then
             scan_nested_apps "$docroot"
         fi
@@ -240,3 +737,5 @@ else
 fi
 
 echo "===SECTION:done==="
+echo "collector_finished=ok"
+echo "timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)"
