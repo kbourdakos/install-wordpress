@@ -62,6 +62,61 @@ else
 fi
 
 # ============================================================================
+# Terminal Colors & Formatting
+# ============================================================================
+_CLR_RST=$'\033[0m'
+_CLR_BOLD=$'\033[1m'
+_CLR_DIM=$'\033[2m'
+_CLR_RED=$'\033[31m'
+_CLR_GREEN=$'\033[32m'
+_CLR_YELLOW=$'\033[33m'
+_CLR_BLUE=$'\033[34m'
+_CLR_MAGENTA=$'\033[35m'
+_CLR_CYAN=$'\033[36m'
+_CLR_WHITE=$'\033[97m'
+
+_RULE="${_CLR_DIM}${_CLR_CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${_CLR_RST}"
+_RULE_LIGHT="${_CLR_DIM}${_CLR_CYAN}──────────────────────────────────────────────────────────────────────${_CLR_RST}"
+
+_section() {
+    local name="$1" title="${2:-$1}"
+    echo ""
+    echo "$_RULE"
+    echo "  ${_CLR_BOLD}${_CLR_CYAN}◆  ${title}${_CLR_RST}"
+    echo "$_RULE"
+    echo "===SECTION:${name}==="
+}
+
+_sub() {
+    echo ""
+    echo "  ${_CLR_BOLD}${_CLR_YELLOW}▸ ${1}${_CLR_RST}"
+    echo "---${1}---"
+}
+
+_kv() {
+    local key="$1" val="$2"
+    echo "${_CLR_GREEN}${key}${_CLR_RST}=${val}"
+}
+
+_info() {
+    echo "  ${_CLR_DIM}${_CLR_WHITE}$1${_CLR_RST}"
+}
+
+_warn() {
+    echo "  ${_CLR_BOLD}${_CLR_RED}⚠  $1${_CLR_RST}"
+}
+
+_banner() {
+    echo ""
+    echo "${_CLR_BOLD}${_CLR_CYAN}"
+    echo "  ╔══════════════════════════════════════════════════════════════════╗"
+    echo "  ║          IMUNIFY360 FORENSIC DATA COLLECTOR                    ║"
+    echo "  ║          Read-Only · All Sections · $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null)          ║"
+    echo "  ╚══════════════════════════════════════════════════════════════════╝"
+    echo "${_CLR_RST}"
+}
+
+# ============================================================================
 # Helper functions
 # ============================================================================
 
@@ -195,58 +250,59 @@ fi
 # Pass --no-dry-run to execute the full forensic collection.
 # ---------------------------------------------------------------------------
 if [[ "$DRY_RUN" == "true" ]]; then
-    echo "===SECTION:dry_run==="
-    echo "mode=dry_run"
-    echo "hostname=$(hostname 2>/dev/null || echo unknown)"
-    echo "current_time=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo unknown)"
-    echo "---w---"
+    _section "dry_run" "Dry Run — Connectivity Check"
+    _kv "mode" "dry_run"
+    _kv "hostname" "$(hostname 2>/dev/null || echo unknown)"
+    _kv "current_time" "$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo unknown)"
+    _sub "w"
     w 2>/dev/null || echo "w_unavailable"
-    echo "===SECTION:done==="
-    echo "collector_finished=dry_run"
-    echo "timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)"
+    _section "done" "Collection Complete"
+    _kv "collector_finished" "dry_run"
+    _kv "timestamp" "$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)"
     exit 0
 fi
 
 # ============================================================================
 # FULL FORENSIC COLLECTION
 # ============================================================================
+_banner
 
 # ---------------------------------------------------------------------------
 # 1. System Information (always runs — lightweight)
 # ---------------------------------------------------------------------------
-echo "===SECTION:system==="
-echo "hostname=$(hostname 2>/dev/null || echo unknown)"
-echo "kernel=$(uname -r 2>/dev/null || echo unknown)"
-echo "arch=$(uname -m 2>/dev/null || echo unknown)"
-echo "os=$(cat /etc/redhat-release 2>/dev/null || grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || echo unknown)"
-echo "uptime=$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
-echo "load=$(cat /proc/loadavg 2>/dev/null || echo unknown)"
-echo "current_time=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo unknown)"
+_section "system" "System Information"
+_kv "hostname" "$(hostname 2>/dev/null || echo unknown)"
+_kv "kernel" "$(uname -r 2>/dev/null || echo unknown)"
+_kv "arch" "$(uname -m 2>/dev/null || echo unknown)"
+_kv "os" "$(cat /etc/redhat-release 2>/dev/null || grep -m1 '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || echo unknown)"
+_kv "uptime" "$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
+_kv "load" "$(cat /proc/loadavg 2>/dev/null || echo unknown)"
+_kv "current_time" "$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || echo unknown)"
 
 # ---------------------------------------------------------------------------
 # 2. Imunify360 Agent
 # ---------------------------------------------------------------------------
 if _run_section "imunify"; then
-echo "===SECTION:imunify==="
+_section "imunify" "Imunify360 Status"
 if command -v imunify360-agent &>/dev/null; then
-    echo "installed=yes"
+    _kv "installed" "yes"
     imunify360-agent version 2>/dev/null || echo "version=unknown"
-    echo "---features---"
+    _sub "features"
     imunify360-agent features list 2>/dev/null || echo "features=unavailable"
-    echo "---config---"
+    _sub "config"
     imunify360-agent config show 2>/dev/null | head -80 || echo "config=unavailable"
-    echo "---signature_db---"
+    _sub "signature_db"
     cat /var/imunify360/files/sigs/v1/description.json 2>/dev/null || echo "not_found"
-    echo "---default_action---"
+    _sub "default_action"
     imunify360-agent config show -v --json 2>/dev/null | grep default_action || echo "unavailable"
-    echo "---sends_file_for_analysis---"
+    _sub "sends_file_for_analysis"
     imunify360-agent config show -v --json 2>/dev/null | grep sends_file_for_analysis || echo "unavailable"
-    echo "---proactive_defense---"
+    _sub "proactive_defense"
     grep PROACTIVE -A5 /etc/sysconfig/imunify360/imunify360-merged.config 2>/dev/null || echo "unavailable"
-    echo "---install_date---"
+    _sub "install_date"
     head -20 /var/log/i360deploy.log 2>/dev/null || echo "not_found"
 else
-    echo "installed=no"
+    _kv "installed" "no"
 fi
 fi # end imunify
 
@@ -255,7 +311,7 @@ fi # end imunify
 #     Outputs: user, uid, home, docroot for every real hosting account.
 #     Always runs so later sections can reference ALL_ACCOUNTS[].
 # ---------------------------------------------------------------------------
-echo "===SECTION:accounts==="
+_section "accounts" "Hosting Accounts Discovery"
 
 # Known system / service account names to skip
 # Exact-match system account names
@@ -359,14 +415,14 @@ if [[ -d /usr/local/directadmin/data/users ]]; then
     done
 fi
 
-echo "total_accounts=${_acct_count}"
+_kv "total_accounts" "${_acct_count}"
 
 # ---------------------------------------------------------------------------
 # 2c. WordPress Sites Discovery
 #     Finds ALL wp-config.php across account home directories.
 #     For each site: account owner, site path, WP version.
 # ---------------------------------------------------------------------------
-echo "===SECTION:wordpress_sites==="
+_section "wordpress_sites" "WordPress Sites Discovery"
 _wp_count=0
 
 _discover_wp_sites() {
@@ -418,15 +474,15 @@ elif [[ ${#ALL_ACCOUNTS[@]} -gt 0 ]]; then
     done < <(getent passwd 2>/dev/null)
 fi
 
-echo "total_wp_sites=${_wp_count}"
+_kv "total_wp_sites" "${_wp_count}"
 
 # ---------------------------------------------------------------------------
 # 3. User / Account Info
 # ---------------------------------------------------------------------------
 if _run_section "user_info"; then
-echo "===SECTION:user_info==="
+_section "user_info" "User / Account Info"
 if [[ -n "$OWNER" ]]; then
-    echo "owner=$OWNER"
+    _kv "owner" "$OWNER"
     # Try common home paths
     HOMEDIR=""
     for base in /home /home2 /var/www /var/vhosts; do
@@ -442,20 +498,20 @@ if [[ -n "$OWNER" ]]; then
         HOMEDIR="${HOMEDIR:-}"
     fi
     if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
-        echo "home=$HOMEDIR"
-        echo "disk_usage=$(du -sh "$HOMEDIR" 2>/dev/null | awk '{print $1}' || echo unknown)"
-        echo "---home_listing---"
+        _kv "home" "$HOMEDIR"
+        _kv "disk_usage" "$(du -sh "$HOMEDIR" 2>/dev/null | awk '{print $1}' || echo unknown)"
+        _sub "home_listing"
         ls -la "$HOMEDIR" 2>/dev/null | head -50
     else
-        echo "home=not_found"
+        _kv "home" "not_found"
     fi
 
     # Crontab
-    echo "---crontab---"
+    _sub "crontab"
     crontab -l -u "$OWNER" 2>/dev/null || echo "no_crontab"
 
     # Recently modified PHP files (last 7 days)
-    echo "---recent_php_files---"
+    _sub "recent_php_files"
     if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
         find "$HOMEDIR" -name '*.php' -mtime -7 -type f \
             ! -path '*/cache/*' ! -path '*/vendor/*' ! -path '*/node_modules/*' \
@@ -466,7 +522,7 @@ if [[ -n "$OWNER" ]]; then
     fi
 
     # Suspicious files: PHP in uploads, hidden directories
-    echo "---suspicious_files---"
+    _sub "suspicious_files"
     if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
         # PHP files in upload dirs
         find "$HOMEDIR" -type f -name '*.php' \( -path '*/uploads/*' -o -path '*/upload/*' -o -path '*/tmp/*' \) \
@@ -484,7 +540,7 @@ if [[ -n "$OWNER" ]]; then
     fi
 
     # World-writable files
-    echo "---world_writable---"
+    _sub "world_writable"
     if [[ -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
         find "$HOMEDIR" -maxdepth 5 -type f -perm -o+w \
             ! -path '*/cache/*' ! -path '*/tmp/*' ! -path '*/logs/*' \
@@ -493,7 +549,7 @@ if [[ -n "$OWNER" ]]; then
         echo "skipped_no_homedir"
     fi
 else
-    echo "owner=not_specified"
+    _kv "owner" "not_specified"
 fi
 fi # end user_info
 
@@ -542,9 +598,9 @@ fi
 # Hidden files scan (user space only, skips known safe dot-dirs)
 # ---------------------------------------------------------------------------
 if _run_section "filesystem"; then
-echo "===SECTION:hidden_files==="
+_section "hidden_files" "Hidden Files Scan"
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
-    echo "---hidden_files_recent---"
+    _sub "hidden_files_recent"
     # Hidden files (dot-name) modified in last 30 days, skip safe dirs
     find "${SCAN_DIRS[@]}" -maxdepth 6 -type f -name '.*' -mtime -30 \
         ! -path '*/.git/*' ! -path '*/.npm/*' \
@@ -565,7 +621,7 @@ if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
         -printf '%T@ %s %m %u %p\n' 2>/dev/null | sort -rn | head -200 | \
         $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
 
-    echo "---files_inside_hidden_dirs---"
+    _sub "files_inside_hidden_dirs"
     # Files inside hidden directories (common malware hiding spot)
     find "${SCAN_DIRS[@]}" -maxdepth 6 -type f -path '*/.*/*' \
         ! -path '*/.git/*' ! -path '*/.npm/*' \
@@ -588,7 +644,7 @@ fi
 # ---------------------------------------------------------------------------
 # Recently modified PHP files (user space, last 7 days)
 # ---------------------------------------------------------------------------
-echo "===SECTION:recent_php==="
+_section "recent_php" "Recently Modified PHP Files (7 days)"
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
     if [[ -n "$OWNER" ]]; then
         # Owner-scoped: only files owned by that user
@@ -614,7 +670,7 @@ fi
 # ---------------------------------------------------------------------------
 # PHP files in wp-content/uploads (should never contain PHP)
 # ---------------------------------------------------------------------------
-echo "===SECTION:php_in_uploads==="
+_section "php_in_uploads" "PHP Files in Uploads (High Risk)"
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
     if [[ -n "$OWNER" ]]; then
         find "${SCAN_DIRS[@]}" -maxdepth 10 -type f -name '*.php*' \
@@ -638,7 +694,7 @@ fi
 # ---------------------------------------------------------------------------
 # Strange PHP files (random/hex names typical of malware droppers)
 # ---------------------------------------------------------------------------
-echo "===SECTION:strange_php==="
+_section "strange_php" "Strange PHP Files (Random/Hex Names)"
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
     if [[ -n "$OWNER" ]]; then
         find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -user "$OWNER" \( \
@@ -670,9 +726,9 @@ fi
 # ---------------------------------------------------------------------------
 # World-writable files and folders + files not owned by expected user
 # ---------------------------------------------------------------------------
-echo "===SECTION:permissions==="
+_section "permissions" "File Permissions Audit"
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
-    echo "---world_writable---"
+    _sub "world_writable"
     if [[ -n "$OWNER" ]]; then
         find "${SCAN_DIRS[@]}" -maxdepth 8 -user "$OWNER" -perm -o+w \
             ! -path '*/cache/*' ! -path '*/tmp/*' ! -path '*/logs/*' \
@@ -691,7 +747,7 @@ if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
             $_AWK '{printf "%s %s %s %s %s\n", $1, strftime("%Y-%m-%d %H:%M:%S", $2), $3, $4, $5}'
     fi
 
-    echo "---not_owned_by_user---"
+    _sub "not_owned_by_user"
     if [[ -n "$OWNER" ]]; then
         # Files inside owner's home NOT owned by them (suspicious ownership change)
         find "${SCAN_DIRS[@]}" -maxdepth 8 ! -user "$OWNER" \
@@ -712,7 +768,7 @@ fi
 # ---------------------------------------------------------------------------
 # Root-owned files in user space (potential privilege escalation / rootkit)
 # ---------------------------------------------------------------------------
-echo "===SECTION:root_files==="
+_section "root_files" "Root-Owned Files in User Space"
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
     if [[ -n "$OWNER" && -n "$HOMEDIR" && -d "$HOMEDIR" ]]; then
         # Root-owned files inside this user's home — shouldn't normally exist
@@ -748,7 +804,7 @@ fi
 # ---------------------------------------------------------------------------
 # PHP files inside .cagefs (should not contain user PHP files)
 # ---------------------------------------------------------------------------
-echo "===SECTION:php_in_cagefs==="
+_section "php_in_cagefs" "PHP Files in CageFS"
 if [[ -n "$OWNER" && -n "$HOMEDIR" && -d "${HOMEDIR}/.cagefs" ]]; then
     find "${HOMEDIR}/.cagefs" -maxdepth 8 -type f -name '*.php*' \
         -printf '%T@ %s %m %p\n' 2>/dev/null | sort -rn | head -200 | \
@@ -767,27 +823,27 @@ fi
 # ---------------------------------------------------------------------------
 # Malware signature scanning (grep-based, user space)
 # ---------------------------------------------------------------------------
-echo "===SECTION:malware_signatures==="
+_section "malware_signatures" "Malware Signature Scanning"
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
-    echo "---obfuscated_php---"
+    _sub "obfuscated_php"
     # Eval + encoding patterns (common obfuscation)
     find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '*.php' ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | \
         xargs -0 grep -lE '(eval\s*\(\s*(base64_decode|gzinflate|gzuncompress|str_rot13|strrev|hex2bin)|assert\s*\(\s*\$|preg_replace\s*\(.*/e)' \
         2>/dev/null | head -100 || echo "none"
 
-    echo "---known_webshells---"
+    _sub "known_webshells"
     # Known webshell signatures
     find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '*.php' ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | \
         xargs -0 grep -lE '(c99shell|r57shell|WSO |FilesMan|b374k|phpspy|webadmin.*shell|Meterpreter|@fsockopen\(|passthru\s*\(|shell_exec\s*\(|system\s*\(\$_(GET|POST|REQUEST)|pcntl_exec)' \
         2>/dev/null | head -100 || echo "none"
 
-    echo "---long_oneliner_php---"
+    _sub "long_oneliner_php"
     # PHP files with first line > 5000 chars (obfuscated/encoded payloads)
     find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '*.php' ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} \
         -exec awk 'NR==1 && length>5000 && /^<\?php/ {print FILENAME}' {} + \
         2>/dev/null | head -100 || echo "none"
 
-    echo "---seo_crypto_injections---"
+    _sub "seo_crypto_injections"
     # SEO spam, redirects, crypto miners in PHP/HTML/JS
     find "${SCAN_DIRS[@]}" -maxdepth 8 -type f \( -name '*.php' -o -name '*.html' -o -name '*.js' \) ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | \
         xargs -0 grep -lE '(<script[^>]*src=.*(\/min\.js|\/stat\.js|\/analytics\.js|evil|malware)|document\.write\(unescape|String\.fromCharCode|coinhive|cryptonight|eval\(atob)' \
@@ -801,7 +857,7 @@ fi
 # Attackers embed PHP, HTML, or JS inside .jpg/.png/.gif/.ico/.svg files.
 # These pass extension-based checks but execute when included/required.
 # ---------------------------------------------------------------------------
-echo "===SECTION:cloaked_images==="
+_section "cloaked_images" "Cloaked Code in Image/Media Files"
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
     # Directories where images live and PHP should NEVER appear
     _IMG_PATHS=( "*/uploads/*" "*/images/*" "*/img/*" "*/media/*" "*/gallery/*"
@@ -817,7 +873,7 @@ if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
         fi
     done
 
-    echo "---php_in_images---"
+    _sub "php_in_images"
     # Image files that contain PHP open tags (<?php, <?=, <? followed by space)
     find "${SCAN_DIRS[@]}" -maxdepth 8 -type f \
         \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' \
@@ -826,7 +882,7 @@ if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
         ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} -print0 2>/dev/null | \
         xargs -0 grep -rlP '<\?php|<\?=|<\?\s' 2>/dev/null | head -100 || echo "none"
 
-    echo "---html_in_images---"
+    _sub "html_in_images"
     # Image files containing HTML/JS code (like the kanan.jpg case: <!DOCTYPE, <html, <script)
     find "${SCAN_DIRS[@]}" -maxdepth 8 -type f \
         \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' \
@@ -835,7 +891,7 @@ if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
         xargs -0 grep -rlEi '<!DOCTYPE|<html|<script|<iframe|document\.write|eval\s*\(' \
         2>/dev/null | head -100 || echo "none"
 
-    echo "---double_extension---"
+    _sub "double_extension"
     # Double-extension files: image.php.jpg, shell.jpg.php, etc.
     find "${SCAN_DIRS[@]}" -maxdepth 8 -type f ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} \( \
         -iname '*.php.jpg' -o -iname '*.php.jpeg' -o -iname '*.php.png' -o -iname '*.php.gif' \
@@ -850,7 +906,7 @@ if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
         $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
     [[ ${PIPESTATUS[0]} -ne 0 ]] || true
 
-    echo "---image_type_mismatch---"
+    _sub "image_type_mismatch"
     # Image files in upload-like dirs whose actual content is PHP/text (MIME mismatch)
     # Uses `file` command to detect real type — catches even heavily obfuscated payloads
     if command -v file &>/dev/null; then
@@ -865,7 +921,7 @@ if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
         echo "file_command_not_available"
     fi
 
-    echo "---large_images_with_code---"
+    _sub "large_images_with_code"
     # Images in uploads > 500KB that contain suspicious byte sequences
     # (legitimate images rarely contain these ASCII strings)
     find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -size +500k \
@@ -881,50 +937,50 @@ fi
 # ---------------------------------------------------------------------------
 # All .htaccess files (malware often injects redirects here)
 # ---------------------------------------------------------------------------
-echo "===SECTION:htaccess==="
+_section "htaccess" "HTAccess Files"
 if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
     find "${SCAN_DIRS[@]}" -maxdepth 8 -type f -name '.htaccess' ${OWNER_FILTER[@]+"${OWNER_FILTER[@]}"} \
-        -exec echo "---{}---" \; -exec cat {} \; 2>/dev/null | head -5000 || echo "none"
+        -exec bash -c "echo ''; echo \"  ${_CLR_BOLD}${_CLR_YELLOW}▸ \$1${_CLR_RST}\"; echo \"---\$1---\"; cat \"\$1\"" _ {} \; 2>/dev/null | head -5000 || echo "none"
 else
     echo "no_scan_dirs_found"
 fi
 
 # Crontabs collection
-echo "===SECTION:crontabs==="
+_section "crontabs" "Crontabs Collection"
 if [[ -n "$OWNER" ]]; then
     # Owner-scoped: only that user's spool file + system entries mentioning them
-    echo "---user_spool---"
+    _sub "user_spool"
     for f in "/var/spool/cron/${OWNER}" "/var/spool/cron/crontabs/${OWNER}"; do
         if [[ -f "$f" ]]; then
-            echo "---${f}---"
+            _sub "${f}"
             cat "$f" 2>/dev/null || echo "unreadable"
         fi
     done
-    echo "---etc_crontab_user---"
+    _sub "etc_crontab_user"
     grep -n "$OWNER" /etc/crontab 2>/dev/null || echo "no_matches"
-    echo "---cron_d_user---"
+    _sub "cron_d_user"
     for f in /etc/cron.d/*; do
         [[ -f "$f" ]] || continue
         matches=$(grep -c "$OWNER" "$f" 2>/dev/null || echo "0")
         if [[ "$matches" -gt 0 ]]; then
-            echo "---${f}---"
+            _sub "${f}"
             grep -n "$OWNER" "$f" 2>/dev/null
         fi
     done
 else
     # No owner: collect everything
-    echo "---etc_crontab---"
+    _sub "etc_crontab"
     cat /etc/crontab 2>/dev/null || echo "not_found"
-    echo "---cron_d---"
+    _sub "cron_d"
     for f in /etc/cron.d/*; do
         [[ -f "$f" ]] || continue
-        echo "---${f}---"
+        _sub "${f}"
         cat "$f" 2>/dev/null || echo "unreadable"
     done
-    echo "---spool_crontabs---"
+    _sub "spool_crontabs"
     for f in /var/spool/cron/* /var/spool/cron/crontabs/*; do
         [[ -f "$f" ]] || continue
-        echo "---${f}---"
+        _sub "${f}"
         cat "$f" 2>/dev/null || echo "unreadable"
     done
 fi
@@ -938,42 +994,42 @@ fi # end filesystem
 inspect_domain() {
     local _domain="$1"
     local _docroot="$2"
-    echo "---domain:${_domain}---"
-    echo "document_root=$_docroot"
-    echo "disk_usage=$(du -sh "$_docroot" 2>/dev/null | awk '{print $1}' || echo unknown)"
-    echo "cms=$(detect_cms "$_docroot")"
+    _sub "domain:${_domain}"
+    _kv "document_root" "$_docroot"
+    _kv "disk_usage" "$(du -sh "$_docroot" 2>/dev/null | awk '{print $1}' || echo unknown)"
+    _kv "cms" "$(detect_cms "$_docroot")"
 
     # WordPress detection
     if [[ -f "${_docroot}/wp-config.php" ]]; then
-        echo "wordpress=yes"
+        _kv "wordpress" "yes"
         local _wpver
         _wpver=$(grep 'wp_version\s*=' "${_docroot}/wp-includes/version.php" 2>/dev/null | grep -oP "'[^']+'" | tr -d "'" || echo "unknown")
-        echo "wp_version=$_wpver"
+        _kv "wp_version" "$_wpver"
         local _dbpfx
         _dbpfx=$(grep 'table_prefix' "${_docroot}/wp-config.php" 2>/dev/null | grep -oP "'[^']+'" | head -1 || echo "wp_")
-        echo "wp_db_prefix=$_dbpfx"
+        _kv "wp_db_prefix" "$_dbpfx"
         local _wpdebug
         _wpdebug=$(grep 'WP_DEBUG' "${_docroot}/wp-config.php" 2>/dev/null | head -1 || echo "not_set")
-        echo "wp_debug=$_wpdebug"
+        _kv "wp_debug" "$_wpdebug"
     else
-        echo "wordpress=no"
+        _kv "wordpress" "no"
     fi
 
-    echo "---docroot_listing:${_domain}---"
+    _sub "docroot_listing:${_domain}"
     ls -la "$_docroot" 2>/dev/null | head -40
 
     # WP-CLI checks (only if WordPress detected and wp-cli available)
     if [[ -f "${_docroot}/wp-config.php" ]] && command -v wp &>/dev/null; then
         local -a _wp=(wp "--path=${_docroot}" --no-color --allow-root)
-        echo "---wp_verify_checksums:${_domain}---"
+        _sub "wp_verify_checksums:${_domain}"
         "${_wp[@]}" core verify-checksums 2>&1 | head -200 || echo "unavailable"
-        echo "---wp_plugin_list:${_domain}---"
+        _sub "wp_plugin_list:${_domain}"
         "${_wp[@]}" plugin list --format=table 2>/dev/null | head -100 || echo "unavailable"
-        echo "---wp_theme_list:${_domain}---"
+        _sub "wp_theme_list:${_domain}"
         "${_wp[@]}" theme list --format=table 2>/dev/null | head -50 || echo "unavailable"
-        echo "---wp_admin_users:${_domain}---"
+        _sub "wp_admin_users:${_domain}"
         "${_wp[@]}" user list --role=administrator --format=table 2>/dev/null | head -50 || echo "unavailable"
-        echo "---wp_cron_events:${_domain}---"
+        _sub "wp_cron_events:${_domain}"
         "${_wp[@]}" cron event list --format=table 2>/dev/null | head -100 || echo "unavailable"
     fi
 }
@@ -1069,20 +1125,20 @@ discover_account_domains() {
 }
 
 if _run_section "domain_info"; then
-echo "===SECTION:domain_info==="
+_section "domain_info" "Domain Information"
 if [[ -n "$DOMAIN" ]]; then
     # Single domain mode
     DOCROOT=$(resolve_docroot "$DOMAIN")
     if [[ -n "$DOCROOT" && -d "$DOCROOT" ]]; then
         inspect_domain "$DOMAIN" "$DOCROOT"
     else
-        echo "domain=$DOMAIN"
-        echo "document_root=not_found"
+        _kv "domain" "$DOMAIN"
+        _kv "document_root" "not_found"
     fi
 elif [[ -n "$OWNER" ]]; then
     # Auto-discover all domains for this account
-    echo "mode=auto_discover"
-    echo "owner=$OWNER"
+    _kv "mode" "auto_discover"
+    _kv "owner" "$OWNER"
     _found=0
     while IFS= read -r _entry; do
         [[ -z "$_entry" ]] && continue
@@ -1100,15 +1156,15 @@ elif [[ -n "$OWNER" ]]; then
                 inspect_domain "$_entry" "$_dr"
                 _found=$((_found + 1))
             else
-                echo "---domain:${_entry}---"
-                echo "document_root=not_found"
+                _sub "domain:${_entry}"
+                _kv "document_root" "not_found"
             fi
         fi
     done < <(discover_account_domains "$OWNER")
-    echo "domains_found=$_found"
+    _kv "domains_found" "$_found"
 else
     # No owner/domain: iterate all discovered accounts and inspect their domains
-    echo "mode=all_accounts"
+    _kv "mode" "all_accounts"
     _found=0
     if [[ ${#ALL_ACCOUNTS[@]} -gt 0 ]]; then
         for _acct in "${ALL_ACCOUNTS[@]}"; do
@@ -1130,10 +1186,10 @@ else
                 fi
             done < <(discover_account_domains "$_acct")
             # Limit to avoid overly long output
-            [[ $_found -ge 50 ]] && echo "truncated_at_50_domains" && break
+            [[ $_found -ge 50 ]] && _warn "truncated_at_50_domains" && break
         done
     fi
-    echo "domains_found=$_found"
+    _kv "domains_found" "$_found"
 fi
 fi # end domain_info
 
@@ -1141,21 +1197,21 @@ fi # end domain_info
 # 5. Imunify360 local SQLite databases (read-only queries)
 # ---------------------------------------------------------------------------
 if _run_section "imunify_db"; then
-echo "===SECTION:imunify_db==="
+_section "imunify_db" "Imunify360 SQLite Databases"
 SQLITE="/opt/alt/sqlite/usr/bin/sqlite3"
 RESDB="/var/imunify360/imunify360-resident.db"
 MAINDB="/var/imunify360/imunify360.db"
 
 if [[ -x "$SQLITE" ]]; then
-    echo "---incident_by_plugin---"
+    _sub "incident_by_plugin"
     echo "select plugin, count(*) from incident group by plugin;" | "$SQLITE" "$RESDB" 2>/dev/null || echo "unavailable"
-    echo "---incident_recent---"
+    _sub "incident_recent"
     echo "select * from incident order by timestamp desc limit 1000;" | "$SQLITE" "$RESDB" 2>/dev/null || echo "unavailable"
-    echo "---malware_hits---"
+    _sub "malware_hits"
     echo "select * from malware_hits limit 1000;" | "$SQLITE" "$MAINDB" 2>/dev/null || echo "unavailable"
-    echo "---malware_ignore_path---"
+    _sub "malware_ignore_path"
     echo "select * from malware_ignore_path limit 1000;" | "$SQLITE" "$MAINDB" 2>/dev/null || echo "unavailable"
-    echo "---malware_scans---"
+    _sub "malware_scans"
     echo "select * from malware_scans limit 1000;" | "$SQLITE" "$MAINDB" 2>/dev/null || echo "unavailable"
 else
     echo "sqlite3_not_found"
@@ -1166,16 +1222,16 @@ fi # end imunify_db
 # 5b. Malware scan queue / recent scan info
 # ---------------------------------------------------------------------------
 if _run_section "imunify_db"; then
-echo "===SECTION:malware_scans==="
+_section "malware_scans" "Malware Scan History"
 if command -v imunify360-agent &>/dev/null; then
-    echo "---malware_history---"
+    _sub "malware_history"
     if [[ -n "$OWNER" ]]; then
         imunify360-agent malware history list --user "$OWNER" --limit 25 2>/dev/null || echo "history=unavailable"
     else
         imunify360-agent malware history list --limit 25 2>/dev/null || echo "history=unavailable"
     fi
 
-    echo "---infected_files---"
+    _sub "infected_files"
     if [[ -n "$OWNER" ]]; then
         imunify360-agent malware malicious list --user "$OWNER" --limit 25 2>/dev/null || echo "malicious=unavailable"
     else
@@ -1191,8 +1247,8 @@ fi # end imunify_db (malware_scans)
 # ---------------------------------------------------------------------------
 if _run_section "network"; then
 OWNER_UID=""
-echo "===SECTION:network==="
-echo "---outbound_connections---"
+_section "network" "Network & Processes"
+_sub "outbound_connections"
 if [[ -n "$OWNER" ]]; then
     # Show network connections for the user
     OWNER_UID=$(id -u "$OWNER" 2>/dev/null || echo "")
@@ -1205,14 +1261,14 @@ else
     ss -tunp 2>/dev/null | grep -v '127.0.0.1' | grep ESTAB | head -40 || echo "none"
 fi
 
-echo "---netstat_all---"
+_sub "netstat_all"
 netstat -tulpan 2>/dev/null | tail -n 3000 || echo "netstat_unavailable"
-echo "---netstat_count---"
+_sub "netstat_count"
 netstat -tulpan 2>/dev/null | wc -l || echo "0"
-echo "---netstat_listening---"
+_sub "netstat_listening"
 netstat -tlpn 2>/dev/null || echo "netstat_unavailable"
 
-echo "---suspicious_processes---"
+_sub "suspicious_processes"
 if [[ -n "$OWNER" ]]; then
     ps -u "$OWNER" -o pid,ppid,cmd,%cpu,%mem,etime --sort=-%cpu 2>/dev/null | head -20 || echo "none"
 else
@@ -1228,10 +1284,10 @@ fi # end network
 # 7. In-memory malware detection
 # ---------------------------------------------------------------------------
 if _run_section "inmemory"; then
-echo "===SECTION:inmemory_malware==="
+_section "inmemory_malware" "In-Memory Malware Detection"
 
 # 7a. Processes running from deleted binaries
-echo "---deleted_binaries---"
+_sub "deleted_binaries"
 for pid_dir in /proc/[0-9]*; do
     pid="${pid_dir##*/}"
     exe_link=$(readlink "${pid_dir}/exe" 2>/dev/null || echo "")
@@ -1244,11 +1300,11 @@ for pid_dir in /proc/[0-9]*; do
 done 2>/dev/null
 
 # 7b. Files in /dev/shm (shared memory payloads)
-echo "---dev_shm---"
+_sub "dev_shm"
 ls -la /dev/shm/ 2>/dev/null | grep -v '^total' | grep -v '^d' | head -30 || echo "empty"
 
 # 7c. Processes using memfd (fileless execution)
-echo "---memfd_processes---"
+_sub "memfd_processes"
 for pid_dir in /proc/[0-9]*; do
     pid="${pid_dir##*/}"
     # Check fd links for memfd references
@@ -1268,7 +1324,7 @@ for pid_dir in /proc/[0-9]*; do
 done 2>/dev/null
 
 # 7d. Suspicious /tmp executables (random-named binaries/scripts)
-echo "---tmp_executables---"
+_sub "tmp_executables"
 find /tmp -maxdepth 2 -type f \( -perm -u+x -o -name '*.sh' -o -name '*.pl' -o -name '*.py' \) \
     -printf '%T@ %u %s %m %p\n' 2>/dev/null | sort -rn | head -20 | \
     $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
@@ -1278,25 +1334,25 @@ find /tmp -maxdepth 2 -type f -mtime -7 -regex '.*/[a-zA-Z0-9]\{6,\}$' \
     $_AWK '{printf "%s %s %s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3, $4, $5}'
 
 # 7e. High-CPU processes (top 10 by CPU, non-root)
-echo "---high_cpu_processes---"
+_sub "high_cpu_processes"
 ps -eo pid,user,%cpu,%mem,etime,args --sort=-%cpu 2>/dev/null | \
     awk 'NR==1 || ($3+0 > 5.0 && $2 != "root" && $2 != "mysql" && $2 != "named")' | head -15 || echo "none"
 
 # 7f. Open file descriptors of high-CPU processes (maps/fds for top suspicious PIDs)
-echo "---hicpu_fd_details---"
+_sub "hicpu_fd_details"
 if [[ -n "$OWNER" ]]; then
     OWNER_UID=$(id -u "$OWNER" 2>/dev/null || echo "")
 fi
 for pid in $(ps -eo pid,%cpu,user --sort=-%cpu 2>/dev/null | awk -v ou="${OWNER_UID:-}" \
     'NR>1 && $2+0 > 10.0 { if (ou == "" || $3 != "root") print $1 }' | head -5); do
-    echo "---pid:${pid}---"
+    _sub "pid:${pid}"
     exe=$(readlink "/proc/${pid}/exe" 2>/dev/null || echo "unknown")
     cmd=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | head -c 300 || echo "unknown")
     owner_uid=$(awk '/^Uid:/{print $2}' "/proc/${pid}/status" 2>/dev/null || echo "?")
     owner_name=$(getent passwd "$owner_uid" 2>/dev/null | cut -d: -f1 || echo "uid:${owner_uid}")
-    echo "exe=${exe}"
-    echo "cmd=${cmd}"
-    echo "user=${owner_name}"
+    _kv "exe" "${exe}"
+    _kv "cmd" "${cmd}"
+    _kv "user" "${owner_name}"
     # Memory maps — look for suspicious mapped files
     grep -vE 'lib(c|pthread|dl|m|rt|nss|resolv|crypt|z\.|ssl|crypto|pcre|xml|curl|gmp|icu)' \
         "/proc/${pid}/maps" 2>/dev/null | grep -v '\[' | awk '{print $NF}' | sort -u | head -20 || echo "maps=unavailable"
@@ -1309,7 +1365,7 @@ fi # end inmemory
 # 8. Imunify360 console log malware extractions (filename, signature, hash)
 # ---------------------------------------------------------------------------
 if _run_section "malware_log"; then
-echo "===SECTION:malware_log_extract==="
+_section "malware_log_extract" "Malware Log Extraction"
 if [[ -f /var/log/imunify360/console.log ]]; then
     grep -oP "'[^']+': \{'[^']+': \{'hits': \[\{'matches': '[^']+', '\w+': \w+, '[^']+': \w+, '\w+': \d+\}\], 'size': \d+, 'hash': '[\\w]+'" \
         /var/log/imunify360/console.log 2>/dev/null | tail -3000 || echo "no_matches"
@@ -1323,13 +1379,13 @@ fi # end malware_log
 # NEW: if --domains is set, also emit a domain-filtered subsection per log
 # ---------------------------------------------------------------------------
 if _run_section "logs"; then
-echo "===SECTION:logs==="
+_section "logs" "Log Tails"
 
 # Build grep pattern from TARGET_DOMAINS for optional domain-filtered view
 _LOG_GREP_PATTERN=""
 if [[ -n "$TARGET_DOMAINS" ]]; then
     _LOG_GREP_PATTERN="${TARGET_DOMAINS//,/|}"
-    echo "domain_filter=${_LOG_GREP_PATTERN}"
+    _kv "domain_filter" "${_LOG_GREP_PATTERN}"
 fi
 
 for logfile in \
@@ -1353,12 +1409,12 @@ for logfile in \
     /var/log/nginx/error.log \
     /var/log/nginx/access.log \
     /var/www/vhosts/system/*/logs/error_log; do
-    [[ -f "$logfile" ]] || { echo "---${logfile}---"; echo "not_found_or_empty"; continue; }
-    echo "---${logfile}---"
+    [[ -f "$logfile" ]] || { _sub "${logfile}"; echo "not_found_or_empty"; continue; }
+    _sub "${logfile}"
     tail -n 3000 "$logfile" 2>/dev/null || echo "not_found_or_empty"
     # NEW: domain-filtered excerpt if --domains was given
     if [[ -n "$_LOG_GREP_PATTERN" ]]; then
-        echo "---${logfile}:domain_filtered---"
+        _sub "${logfile}:domain_filtered"
         grep -E "$_LOG_GREP_PATTERN" "$logfile" 2>/dev/null | tail -n 500 || echo "no_domain_matches"
     fi
 done
@@ -1370,7 +1426,7 @@ fi # end logs
 # detection and nested app discovery for each domain.
 # ---------------------------------------------------------------------------
 if [[ -n "$TARGET_DOMAINS" ]]; then
-echo "===SECTION:domain_summary_json==="
+_section "domain_summary_json" "Domain Summary (JSON)"
 echo "["
 
 IFS=',' read -ra _DOM_ARRAY <<< "$TARGET_DOMAINS"
@@ -1406,6 +1462,9 @@ fi # end domain_summary_json
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
-echo "===SECTION:done==="
-echo "collector_finished=ok"
-echo "timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)"
+_section "done" "Collection Complete"
+_kv "collector_finished" "ok"
+_kv "timestamp" "$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)"
+echo ""
+echo "  ${_CLR_BOLD}${_CLR_GREEN}✔  All sections collected successfully${_CLR_RST}"
+echo ""
