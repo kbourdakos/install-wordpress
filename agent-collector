@@ -1,0 +1,242 @@
+#!/bin/bash
+# ============================================================================
+# im360_forensic_collector_v6_universal.sh
+#
+# FEATURES:
+# - Universal Panel Support: cPanel, Plesk, DirectAdmin, FastPanel, Custom.
+# - Deep Nested Discovery: Finds WP/Joomla/Laravel inside subfolders.
+# - CMS Detection: WP, Magento, Presta, Joomla, Drupal, OpenCart, Laravel.
+#
+# Usage:
+#   bash collector.sh --domains "example.com,shop.net" --no-dry-run
+# ============================================================================
+
+set -uo pipefail
+
+# --- Variables ---
+OWNER=""
+DOMAIN_ARG=""
+DOMAINS_LIST_ARG=""
+FINAL_TARGETS=""
+OUTFILE=""
+DRY_RUN="true"
+SCAN_DIRS=()
+
+# --- Detect awk ---
+if command -v gawk &>/dev/null; then _AWK=gawk; else _AWK=awk; fi
+
+# --- Argument Parsing ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --owner)      [[ $# -ge 2 ]] && OWNER="$2" && shift 2 ;;
+        --domain)     [[ $# -ge 2 ]] && DOMAIN_ARG="$2" && shift 2 ;;
+        --domains)    [[ $# -ge 2 ]] && DOMAINS_LIST_ARG="$2" && shift 2 ;;
+        --out)        [[ $# -ge 2 ]] && OUTFILE="$2" && shift 2 ;;
+        --no-dry-run) DRY_RUN="false"; shift ;;
+        --dry-run)    DRY_RUN="true"; shift ;;
+        *)            shift ;;
+    esac
+done
+
+# Merge domain args
+if [[ -n "$DOMAIN_ARG" ]]; then FINAL_TARGETS="$DOMAIN_ARG"; fi
+if [[ -n "$DOMAINS_LIST_ARG" ]]; then
+    if [[ -n "$FINAL_TARGETS" ]]; then FINAL_TARGETS="$FINAL_TARGETS,$DOMAINS_LIST_ARG"; else FINAL_TARGETS="$DOMAINS_LIST_ARG"; fi
+fi
+
+# Redirect output
+if [[ -n "$OUTFILE" ]]; then exec > "$OUTFILE"; echo "Writing output to $OUTFILE" >&2; fi
+
+# --- Dry Run Check ---
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "===SECTION:dry_run==="
+    echo "message=Pass --no-dry-run to execute. This scan crawls nested directories."
+    exit 0
+fi
+
+# ============================================================================
+# UNIVERSAL RESOLVER & CMS DETECTION
+# ============================================================================
+
+resolve_docroot() {
+    local domain="$1"
+    
+    # 1. PLESK (Standard & Subdomains)
+    if [[ -d "/var/www/vhosts/$domain/httpdocs" ]]; then echo "/var/www/vhosts/$domain/httpdocs"; return; fi
+    if [[ -d "/var/www/vhosts/$domain" ]]; then echo "/var/www/vhosts/$domain"; return; fi
+
+    # 2. DIRECTADMIN (Standard Layout: /home/USER/domains/DOMAIN/public_html)
+    # We try to find the user who owns the domain via grep or wildcard
+    local da_path=$(find /home -maxdepth 4 -path "*/domains/$domain/public_html" -type d 2>/dev/null | head -1)
+    if [[ -n "$da_path" ]]; then echo "$da_path"; return; fi
+
+    # 3. cPANEL (Lookup user in /etc/userdomains)
+    if [[ -f /etc/userdomains ]]; then
+        local user=$(grep "^${domain}:" /etc/userdomains | cut -d: -f2 | xargs)
+        if [[ -n "$user" ]]; then
+             if [[ -d "/home/$user/public_html" ]]; then echo "/home/$user/public_html"; return; fi
+             if [[ -d "/home2/$user/public_html" ]]; then echo "/home2/$user/public_html"; return; fi
+        fi
+    fi
+
+    # 4. FASTPANEL (Standard Layout: /var/www/USER/data/www/DOMAIN)
+    local fp_path=$(find /var/www -maxdepth 4 -path "*/data/www/$domain" -type d 2>/dev/null | head -1)
+    if [[ -n "$fp_path" ]]; then echo "$fp_path"; return; fi
+
+    # 5. CYBERPANEL / GENERIC APACHE/NGINX
+    if [[ -d "/home/$domain/public_html" ]]; then echo "/home/$domain/public_html"; return; fi
+    if [[ -d "/var/www/$domain/public_html" ]]; then echo "/var/www/$domain/public_html"; return; fi
+    if [[ -d "/var/www/$domain" ]]; then echo "/var/www/$domain"; return; fi
+    if [[ -d "/var/www/html/$domain" ]]; then echo "/var/www/html/$domain"; return; fi
+
+    # 6. Fallback: Grep Web Server Configs
+    for conf in /etc/apache2/sites-enabled /etc/httpd/conf/httpd.conf /etc/nginx/sites-enabled /usr/local/apache/conf/httpd.conf; do
+        if [[ -e "$conf" ]]; then
+            local path=$(grep -rA10 "$domain" "$conf" 2>/dev/null | grep -iE "DocumentRoot|root" | head -1 | awk '{print $2}' | tr -d '";')
+            if [[ -n "$path" && -d "$path" ]]; then echo "$path"; return; fi
+        fi
+    done
+
+    echo "NOT_FOUND"
+}
+
+detect_cms() {
+    local dir="$1"
+    [[ ! -d "$dir" ]] && echo "Invalid Path" && return
+
+    # Signatures
+    if [[ -f "$dir/wp-config.php" ]]; then
+        local ver="Unknown"
+        [[ -f "$dir/wp-includes/version.php" ]] && ver=$(grep "wp_version =" "$dir/wp-includes/version.php" | cut -d"'" -f2)
+        echo "WordPress (v$ver)"
+        return
+    fi
+    if [[ -f "$dir/configuration.php" && -d "$dir/administrator" ]]; then echo "Joomla"; return; fi
+    if [[ -f "$dir/config/settings.inc.php" || -f "$dir/app/config/parameters.php" ]]; then echo "PrestaShop"; return; fi
+    if [[ -f "$dir/app/etc/env.php" || -f "$dir/app/etc/local.xml" ]]; then echo "Magento"; return; fi
+    if [[ -f "$dir/artisan" && -d "$dir/app" ]]; then echo "Laravel"; return; fi
+    if [[ -f "$dir/sites/default/settings.php" || -f "$dir/core/lib/Drupal.php" ]]; then echo "Drupal"; return; fi
+    if [[ -f "$dir/config.php" && -d "$dir/admin" && -f "$dir/admin/config.php" ]]; then echo "OpenCart"; return; fi
+    
+    echo "Unknown/Custom"
+}
+
+scan_nested_apps() {
+    local root="$1"
+    
+    # We scan 6 levels deep for specific CMS config markers.
+    # We EXCLUDE cache, vendor, node_modules, and .git to prevent false positives and slow scans.
+    
+    find "$root" -maxdepth 6 \
+        \( -name "wp-config.php" -o -name "configuration.php" -o -name "artisan" \
+           -o -name "env.php" -o -name "settings.inc.php" -o -name "config.php" \) \
+        ! -path "*/vendor/*" ! -path "*/node_modules/*" ! -path "*/cache/*" \
+        ! -path "*/wp-includes/*" ! -path "*/.git/*" ! -path "*/storage/*" \
+        -print0 2>/dev/null | while IFS= read -r -d '' file; do
+        
+        local app_dir=$(dirname "$file")
+        
+        # Skip if it is the root (already reported as main app)
+        if [[ "$app_dir" == "$root" ]]; then continue; fi
+        if [[ "$app_dir/" == "$root/" ]]; then continue; fi
+
+        # Identify child app
+        local child_type=$(detect_cms "$app_dir")
+        local rel_path="${app_dir#$root}"
+        
+        # Only report if we successfully identified a known CMS or if it really looks like one
+        if [[ "$child_type" != "Unknown/Custom" ]]; then
+             printf "   |__ [NESTED] %-20s | %-40s\n" "$child_type" "$rel_path"
+        fi
+    done
+}
+
+# ============================================================================
+# MAIN SCANNING LOGIC
+# ============================================================================
+
+echo "===SECTION:system==="
+echo "hostname=$(hostname 2>/dev/null)"
+echo "timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+# 1. Quick Global Filesystem Check (Standard Forensic)
+if [[ -n "$OWNER" ]]; then
+    _hdir=$(getent passwd "$OWNER" 2>/dev/null | cut -d: -f6)
+    [[ -n "$_hdir" && -d "$_hdir" ]] && SCAN_DIRS=("$_hdir")
+else
+    for _base in /home /home2 /var/www /var/vhosts /var/www/vhosts; do
+        [[ -d "$_base" ]] && SCAN_DIRS+=("$_base")
+    done
+fi
+
+echo "===SECTION:filesystem_quick==="
+if [[ ${#SCAN_DIRS[@]} -gt 0 ]]; then
+    echo "---recent_php_files_7days (Limit 50)---"
+    find "${SCAN_DIRS[@]}" -maxdepth 4 -type f -name '*.php' -mtime -7 \
+        ! -path '*/cache/*' ! -path '*/vendor/*' \
+        -printf '%T@ %s %p\n' 2>/dev/null | sort -rn | head -50 | \
+        $_AWK '{printf "%s %s %s\n", strftime("%Y-%m-%d %H:%M:%S", $1), $2, $3}'
+else
+    echo "No standard directories found to scan."
+fi
+
+# 2. Logs
+echo "===SECTION:logs==="
+grep_pattern=""
+if [[ -n "$FINAL_TARGETS" ]]; then
+    grep_pattern="${FINAL_TARGETS//,/|}"
+    echo "Log Filter Active: $grep_pattern"
+fi
+
+for logfile in /var/log/imunify360/console.log /var/log/httpd/error_log /var/log/nginx/error.log /usr/local/apache/logs/error_log; do
+    if [[ -f "$logfile" ]]; then
+        echo "---${logfile}---"
+        if [[ -n "$grep_pattern" ]]; then
+            grep -E "$grep_pattern" "$logfile" 2>/dev/null | tail -n 100 || echo "No matches found"
+        else
+            tail -n 100 "$logfile" 2>/dev/null
+        fi
+    fi
+done
+
+# ============================================================================
+# FINAL SUMMARY: UNIVERSAL NESTED DISCOVERY
+# ============================================================================
+echo ""
+echo "===SECTION:target_summary==="
+echo "Timestamp: $(date -u)"
+
+if [[ -z "$FINAL_TARGETS" ]]; then
+    echo "No specific domains targeted."
+else
+    echo "----------------------------------------------------------------------------------------------------"
+    printf "%-30s | %-25s | %-40s\n" "DOMAIN/PATH" "APPLICATION" "LOCATION"
+    echo "----------------------------------------------------------------------------------------------------"
+
+    IFS=',' read -ra DOM_ARRAY <<< "$FINAL_TARGETS"
+    
+    for d in "${DOM_ARRAY[@]}"; do
+        d=$(echo "$d" | xargs)
+        
+        # 1. Resolve Root (Universal Method)
+        docroot=$(resolve_docroot "$d")
+        
+        # 2. Detect Main App
+        if [[ "$docroot" == "NOT_FOUND" ]]; then
+            app_type="Path not found"
+        else
+            app_type=$(detect_cms "$docroot")
+        fi
+        
+        # 3. Print Main Row
+        printf "%-30s | %-25s | %-40s\n" "$d" "$app_type" "$docroot"
+        
+        # 4. Deep Recursion for Nested Apps
+        if [[ "$docroot" != "NOT_FOUND" ]]; then
+            scan_nested_apps "$docroot"
+        fi
+    done
+    echo "----------------------------------------------------------------------------------------------------"
+fi
+
+echo "===SECTION:done==="
