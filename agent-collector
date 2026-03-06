@@ -3,9 +3,9 @@
 # im360_forensic_collector_v10.sh
 #
 # FIXES:
-# - Moved all Function Definitions to the top to prevent "command not found".
-# - Ensured resolve_docroot is available globally.
-# - Preserved all original forensic logic.
+# - Moved all Function Definitions to the HEADER.
+# - Solves "command not found" errors for resolve_docroot/detect_cms.
+# - Preserves all original forensic logic (Filesystem, DB, Memory, Logs).
 #
 # Usage:
 #   bash collector.sh --domains "example.com" --no-dry-run
@@ -319,7 +319,7 @@ if [[ -d /var/cpanel/users ]]; then
 fi
 echo "total_accounts=${_acct_count}"
 
-# 4. WordPress Sites (Partial Logic for truncated scan)
+# 4. WordPress Sites
 echo "===SECTION:wordpress_sites==="
 _wp_count=0
 _discover_wp_sites() {
